@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sldl</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500&family=Plus+Jakarta+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:   #080705;
+  --s1:   #0f0c09;
+  --s2:   #171310;
+  --s3:   #201c17;
+  --b1:   #2a2318;
+  --b2:   #3d3226;
+  --t1:   #ede8de;
+  --t2:   #9b8c7a;
+  --t3:   #564a3b;
+  --a:    #c88a4c;
+  --a2:   #dea06a;
+  --abg:  rgba(200,138,76,0.09);
+  --ok:   #72bf8c;
+  --err:  #d97474;
+  --warn: #d4ac4c;
+  --pu:   #a47ec8;
+  --fd:   'Fraunces', Georgia, serif;
+  --fu:   'Plus Jakarta Sans', system-ui, sans-serif;
+  --fm:   'JetBrains Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--fu);
+  background: var(--bg);
+  color: var(--t1);
+  min-height: 100vh;
+}
+
+/* Grain overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)'/%3E%3C/svg%3E");
+  opacity: 0.03;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ── HEADER ── */
+.header {
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--b1);
+}
+.header-wordmark {
+  font-family: var(--fd);
+  font-size: 1.4rem;
+  font-weight: 300;
+  font-style: italic;
+  letter-spacing: 0.1em;
+  color: var(--t1);
+  text-transform: lowercase;
+  user-select: none;
+}
+.header-wordmark b {
+  font-style: normal;
+  font-weight: 500;
+  color: var(--a);
+}
+.clear-btn {
+  background: none;
+  border: 1px solid var(--b1);
+  border-radius: 5px;
+  color: var(--t3);
+  font-family: var(--fu);
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  padding: 0.3rem 0.65rem;
+  transition: border-color 0.15s, color 0.15s;
+}
+.clear-btn:hover { border-color: var(--b2); color: var(--t2); }
+
+/* ── SEARCH ── */
+.search-section {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--b1);
+  background: var(--s1);
+}
+.search-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.search-inputs { display: flex; gap: 0.45rem; flex: 1; min-width: 0; }
+.search-controls { display: flex; gap: 0.45rem; flex-shrink: 0; }
+
+input[type="text"] {
+  flex: 1; min-width: 0;
+  padding: 0.58rem 0.85rem;
+  background: var(--s2);
+  border: 1px solid var(--b1);
+  border-radius: 6px;
+  color: var(--t1);
+  font-family: var(--fu);
+  font-size: 0.88rem;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+input[type="text"]::placeholder { color: var(--t3); }
+input[type="text"]:focus { border-color: var(--b2); background: var(--s3); }
+
+.toggle {
+  display: flex;
+  background: var(--s2);
+  border: 1px solid var(--b1);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.toggle button {
+  padding: 0.56rem 1rem;
+  background: none; border: none;
+  color: var(--t3);
+  font-family: var(--fu);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+.toggle button.active { background: var(--s3); color: var(--t1); }
+.toggle button:hover:not(.active) { color: var(--t2); }
+
+button.search-btn {
+  padding: 0.56rem 1.25rem;
+  background: var(--a);
+  border: none;
+  border-radius: 6px;
+  color: #110e0b;
+  font-family: var(--fu);
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+button.search-btn:hover { background: var(--a2); }
+
+/* ── DOWNLOAD PANELS ── */
+#panels {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  z-index: 150;
+  width: 400px;
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  pointer-events: none;
+}
+
+.panel {
+  background: var(--s1);
+  border: 1px solid var(--b2);
+  border-radius: 8px;
+  overflow: hidden;
+  pointer-events: auto;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.6), 0 2px 8px rgba(0,0,0,0.4);
+}
+.panel-header {
+  padding: 0.5rem 0.9rem;
+  background: var(--s2);
+  border-bottom: 1px solid var(--b1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.panel-query {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--fm);
+  font-size: 0.71rem;
+  color: var(--t2);
+  min-width: 0;
+}
+.panel-header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-shrink: 0;
+}
+.status {
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--warn);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.status.done  { color: var(--ok); }
+.status.error { color: var(--err); }
+.panel-close {
+  background: none; border: none;
+  color: var(--t3);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  transition: color 0.15s;
+}
+.panel-close:hover { color: var(--t2); }
+
+.terminal {
+  padding: 0.7rem 1rem;
+  font-family: var(--fm);
+  font-size: 0.73rem;
+  color: var(--t2);
+  max-height: 12rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  line-height: 1.6;
+}
+.terminal::-webkit-scrollbar { width: 3px; }
+.terminal::-webkit-scrollbar-thumb { background: var(--b2); border-radius: 2px; }
+
+.line-error { color: var(--err); }
+.line-warn  { color: var(--warn); }
+.line-ok    { color: var(--ok); }
+.line-beets { color: var(--pu); }
+
+/* ── RESULTS SECTION ── */
+.results-section {
+  padding: 1rem 1.5rem 3rem;
+}
+
+#results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
+  gap: 0.8rem;
+  align-items: start;
+}
+
+.empty {
+  color: var(--t3);
+  font-size: 0.85rem;
+  font-style: italic;
+  padding: 2.5rem 0;
+  grid-column: 1 / -1;
+}
+
+/* ── RESULT CARD ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.result-item {
+  background: var(--s1);
+  border: 1px solid var(--b1);
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  animation: fadeUp 0.24s ease both;
+}
+.result-item:hover {
+  border-color: var(--b2);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.35);
+}
+.result-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+
+/* Artwork */
+.result-art-wrap {
+  width: 100%;
+  aspect-ratio: 1;
+  background: var(--s2);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.result-art-wrap img {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.35s ease;
+}
+.result-item:hover .result-art-wrap img { transform: scale(1.04); }
+.art-placeholder { color: var(--b2); font-size: 2.5rem; user-select: none; }
+
+/* Card body text */
+.result-body {
+  flex: 1;
+  padding: 0.65rem 0.75rem 0.4rem;
+  min-width: 0;
+}
+.result-title {
+  font-family: var(--fd);
+  font-size: 0.95rem;
+  font-weight: 400;
+  color: var(--t1);
+  line-height: 1.3;
+}
+.result-meta {
+  font-size: 0.74rem;
+  color: var(--t2);
+  margin-top: 0.22rem;
+}
+.result-meta2 {
+  font-size: 0.68rem;
+  color: var(--t3);
+  margin-top: 0.12rem;
+}
+.tag {
+  display: inline-block;
+  padding: 0.08rem 0.38rem;
+  background: var(--s3);
+  border: 1px solid var(--b1);
+  border-radius: 3px;
+  font-size: 0.6rem;
+  color: var(--t3);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin: 0 0.2rem 0.2rem 0;
+}
+
+/* Card action */
+.result-actions {
+  padding: 0.5rem 0.6rem;
+  border-top: 1px solid var(--b1);
+}
+.dl-btn {
+  width: 100%;
+  padding: 0.44rem 0.5rem;
+  background: var(--abg);
+  border: 1px solid var(--a);
+  border-radius: 5px;
+  color: var(--a);
+  font-family: var(--fu);
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+  transition: background 0.15s, color 0.15s;
+}
+.dl-btn:hover { background: var(--a); color: #110e0b; }
+
+/* ── MODAL ── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(8,7,5,0.82);
+  backdrop-filter: blur(6px);
+  z-index: 200;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.modal-overlay.open { display: flex; }
+
+@keyframes modalIn {
+  from { opacity: 0; transform: scale(0.97) translateY(10px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+.modal {
+  background: var(--s1);
+  border: 1px solid var(--b2);
+  border-radius: 12px;
+  width: 100%;
+  max-width: 860px;
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: modalIn 0.2s cubic-bezier(0.2,0,0,1) both;
+}
+
+.modal-hdr {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--b1);
+  background: var(--s2);
+  flex-shrink: 0;
+}
+.modal-album {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  flex: 1;
+  min-width: 0;
+}
+.modal-art-wrap {
+  width: 52px;
+  height: 52px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--s3);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.modal-art-wrap img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.modal-art-placeholder { color: var(--b2); font-size: 1.4rem; }
+.modal-info { min-width: 0; flex: 1; }
+.modal-title {
+  font-family: var(--fd);
+  font-size: 1.05rem;
+  font-weight: 400;
+  color: var(--t1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.modal-meta {
+  font-size: 0.74rem;
+  color: var(--t2);
+  margin-top: 0.15rem;
+}
+.modal-close {
+  background: none;
+  border: 1px solid var(--b1);
+  border-radius: 5px;
+  color: var(--t3);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0.3rem 0.5rem;
+  flex-shrink: 0;
+  transition: border-color 0.15s, color 0.15s;
+}
+.modal-close:hover { border-color: var(--b2); color: var(--t2); }
+
+.modal-body {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.modal-tracks-col {
+  width: 210px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--b1);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modal-results-col {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+.modal-col-hdr {
+  padding: 0.4rem 0.85rem;
+  font-size: 0.64rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--t3);
+  font-weight: 600;
+  border-bottom: 1px solid var(--b1);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
+.modal-tracks-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.3rem 0.55rem;
+}
+.modal-tracks-list::-webkit-scrollbar { width: 3px; }
+.modal-tracks-list::-webkit-scrollbar-thumb { background: var(--b2); border-radius: 2px; }
+
+.track-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.19rem 0;
+  font-size: 0.74rem;
+  border-top: 1px solid var(--b1);
+}
+.track-row:first-child { border-top: none; }
+.track-num {
+  color: var(--t3);
+  width: 1.5rem;
+  text-align: right;
+  flex-shrink: 0;
+  font-family: var(--fm);
+  font-size: 0.67rem;
+  font-variant-numeric: tabular-nums;
+}
+.track-title { flex: 1; color: var(--t1); }
+.track-dur {
+  color: var(--t3);
+  flex-shrink: 0;
+  font-family: var(--fm);
+  font-size: 0.67rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.modal-results-area {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.65rem 0.85rem;
+  font-family: var(--fm);
+  font-size: 0.71rem;
+  color: var(--t3);
+  line-height: 1.55;
+}
+.modal-results-area::-webkit-scrollbar { width: 3px; }
+.modal-results-area::-webkit-scrollbar-thumb { background: var(--b2); border-radius: 2px; }
+
+/* ── PREVIEW RESULT CARDS (inside modal) ── */
+.preview-result-card {
+  padding: 0.5rem 0;
+  border-top: 1px solid var(--b1);
+}
+.preview-result-card:first-of-type { border-top: none; }
+
+.preview-line-folder { color: #7ec8da; }
+.preview-line-file   { color: var(--t2); }
+.preview-line-user   { color: var(--pu); }
+.preview-line-err    { color: var(--err); }
+
+.preview-dl-btn {
+  padding: 0.3rem 0.6rem;
+  background: rgba(114,191,140,0.09);
+  border: 1px solid var(--ok);
+  border-radius: 4px;
+  color: var(--ok);
+  font-family: var(--fu);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.preview-dl-btn:hover { background: rgba(114,191,140,0.2); }
+
+/* ── RESPONSIVE ── */
+@media (max-width: 640px) {
+  .header, .search-section, .results-section { padding-left: 1rem; padding-right: 1rem; }
+  .search-inputs { flex-basis: 100%; }
+  .search-controls { flex-basis: 100%; }
+  button.search-btn { flex: 1; }
+  #results { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 0.6rem; }
+
+  #panels { width: calc(100% - 2rem); right: 1rem; left: 1rem; }
+  .modal-tracks-col { display: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="header">
+  <div class="header-wordmark">sl<b>dl</b></div>
+  <button class="clear-btn" onclick="clearAll()">clear all</button>
+</header>
+
+<div class="search-section">
+  <div class="search-row">
+    <div class="search-inputs">
+      <input type="text" id="q-artist" placeholder="Artist" autocomplete="off">
+      <input type="text" id="q-title" placeholder="Album / Track" autocomplete="off">
+    </div>
+    <div class="search-controls">
+      <div class="toggle">
+        <button id="btn-track" onclick="setType('track')">Tracks</button>
+        <button class="active" id="btn-album" onclick="setType('album')">Albums</button>
+      </div>
+      <button class="search-btn" onclick="search()">Search</button>
+    </div>
+  </div>
+</div>
+
+<div id="panels"></div>
+
+<div class="results-section">
+  <div id="results"></div>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal" id="modal">
+    <div class="modal-hdr">
+      <div class="modal-album">
+        <div class="modal-art-wrap" id="modal-art"></div>
+        <div class="modal-info">
+          <div class="modal-title" id="modal-title"></div>
+          <div class="modal-meta" id="modal-meta"></div>
+        </div>
+      </div>
+      <button class="modal-close" id="modal-close-btn">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-tracks-col" id="modal-tracks-col">
+        <div class="modal-col-hdr">Tracklist</div>
+        <div class="modal-tracks-list" id="modal-tracks"></div>
+      </div>
+      <div class="modal-results-col">
+        <div class="modal-col-hdr" id="modal-results-hdr">Soulseek</div>
+        <div class="modal-results-area" id="modal-results"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let searchType = 'album';
+const trackCache = {};
+
+function setType(t) {
+  searchType = t;
+  document.getElementById('btn-track').classList.toggle('active', t === 'track');
+  document.getElementById('btn-album').classList.toggle('active', t === 'album');
+}
+
+document.querySelectorAll('#q-artist, #q-title').forEach(el => {
+  el.addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+});
+
+async function search() {
+  const artist = document.getElementById('q-artist').value.trim();
+  const title  = document.getElementById('q-title').value.trim();
+  if (!artist && !title) return;
+
+  const parts = [];
+  if (searchType === 'track') {
+    if (title)  parts.push(`recording:"${title}"`);
+    if (artist) parts.push(`artist:"${artist}"`);
+  } else {
+    if (title)  parts.push(`releasegroup:"${title}"`);
+    if (artist) parts.push(`artist:"${artist}"`);
+  }
+
+  const res = document.getElementById('results');
+  res.innerHTML = '<div class="empty">Searching…</div>';
+
+  try {
+    const r = await fetch(`/search?q=${encodeURIComponent(parts.join(' AND '))}&type=${searchType}`);
+    const data = await r.json();
+    renderResults(data, searchType);
+  } catch (e) {
+    res.innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+  }
+}
+
+function renderResults(data, type) {
+  const res = document.getElementById('results');
+  let items = [];
+
+  if (type === 'track') {
+    items = (data.recordings || []).map(r => {
+      const artist = (r['artist-credit'] || []).map(a => a.name || a.artist?.name).join('');
+      const rel    = (r.releases || [])[0];
+      return {
+        id: r.id,
+        label: r.title,
+        artist,
+        year: r['first-release-date']?.slice(0, 4) || rel?.date?.slice(0, 4) || '',
+        duration: r.length ? fmtDuration(r.length) : '',
+        albumName: rel?.title || '',
+        albumType: rel?.['release-group']?.['primary-type'] || '',
+        disambiguation: r.disambiguation || '',
+        query: `${artist} - ${r.title}`,
+        isAlbum: false,
+      };
+    });
+  } else {
+    items = (data['release-groups'] || []).map(r => {
+      const artist = (r['artist-credit'] || []).map(a => a.name || a.artist?.name).join('');
+      const secondaryTypes = r['secondary-types'] || [];
+      return {
+        id: r.id,
+        label: r.title,
+        artist,
+        year: r['first-release-date']?.slice(0, 4) || '',
+        releaseType: r['primary-type'] || '',
+        secondaryTypes,
+        disambiguation: r.disambiguation || '',
+        query: `${artist} - ${r.title}`,
+        isAlbum: true,
+      };
+    });
+  }
+
+  if (!items.length) {
+    res.innerHTML = '<div class="empty">No results.</div>';
+    return;
+  }
+
+  res.innerHTML = '';
+  items.forEach((item, i) => {
+    const key = item.id || String(i);
+
+    const tags = [];
+    if (item.releaseType) tags.push(item.releaseType);
+    if (item.secondaryTypes) item.secondaryTypes.forEach(t => tags.push(t));
+    if (item.albumType && !item.releaseType) tags.push(item.albumType);
+
+    const metaParts = [esc(item.artist)];
+    if (item.year)       metaParts.push(item.year);
+    if (item.duration)   metaParts.push(item.duration);
+    if (item.trackCount) metaParts.push(`${item.trackCount} tracks`);
+
+    const meta2Parts = [];
+    if (item.albumName)      meta2Parts.push(esc(item.albumName));
+    if (item.country)        meta2Parts.push(item.country);
+    if (item.labelName)      meta2Parts.push(esc(item.labelName));
+    if (item.disambiguation) meta2Parts.push(`<em>${esc(item.disambiguation)}</em>`);
+
+    const ri = document.createElement('div');
+    ri.className = 'result-item';
+    ri.id = `ri-${key}`;
+    ri.style.animationDelay = `${Math.min(i * 28, 300)}ms`;
+
+    const main = document.createElement('div');
+    main.className = 'result-main';
+
+    const artWrap = document.createElement('div');
+    artWrap.className = 'result-art-wrap';
+    if (item.isAlbum && item.id) {
+      const img = document.createElement('img');
+      img.src = `https://coverartarchive.org/release-group/${item.id}/front-250`;
+      img.alt = '';
+      img.loading = 'lazy';
+      img.onerror = () => { artWrap.innerHTML = '<span class="art-placeholder">♪</span>'; };
+      artWrap.appendChild(img);
+    } else {
+      artWrap.innerHTML = '<span class="art-placeholder">♪</span>';
+    }
+
+    const body = document.createElement('div');
+    body.className = 'result-body';
+    body.innerHTML = `
+      <div class="result-title">${esc(item.label)}</div>
+      <div class="result-meta">${metaParts.join(' · ')}</div>
+      ${tags.length ? `<div class="result-meta2">${tags.map(t => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
+      ${meta2Parts.length ? `<div class="result-meta2">${meta2Parts.join(' · ')}</div>` : ''}
+    `;
+
+    const actions = document.createElement('div');
+    actions.className = 'result-actions';
+
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'dl-btn';
+    dlBtn.textContent = '↓ Download';
+    dlBtn.onclick = () => openModal(item);
+    actions.appendChild(dlBtn);
+
+    main.append(artWrap, body, actions);
+    ri.appendChild(main);
+    res.appendChild(ri);
+  });
+}
+
+// ── MODAL ──
+
+let currentAbortController = null;
+
+document.getElementById('modal-overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('modal-overlay')) closeModal();
+});
+document.getElementById('modal-close-btn').addEventListener('click', closeModal);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+function openModal(item) {
+  if (currentAbortController) currentAbortController.abort();
+  currentAbortController = new AbortController();
+
+  // Header: art
+  const artWrap = document.getElementById('modal-art');
+  artWrap.innerHTML = '';
+  if (item.isAlbum && item.id) {
+    const img = document.createElement('img');
+    img.src = `https://coverartarchive.org/release-group/${item.id}/front-250`;
+    img.alt = '';
+    img.onerror = () => { artWrap.innerHTML = '<span class="modal-art-placeholder">♪</span>'; };
+    artWrap.appendChild(img);
+  } else {
+    artWrap.innerHTML = '<span class="modal-art-placeholder">♪</span>';
+  }
+
+  // Header: text
+  document.getElementById('modal-title').textContent = item.label;
+  const metaParts = [item.artist];
+  if (item.year) metaParts.push(item.year);
+  if (item.trackCount) metaParts.push(`${item.trackCount} tracks`);
+  document.getElementById('modal-meta').textContent = metaParts.join(' · ');
+
+  // Tracks col: albums only
+  const tracksCol = document.getElementById('modal-tracks-col');
+  const tracksList = document.getElementById('modal-tracks');
+  if (item.isAlbum && item.id) {
+    tracksCol.style.display = '';
+    tracksList.innerHTML = '<div class="track-row" style="color:var(--t3);font-style:italic;border:none;">Loading…</div>';
+    loadModalTracks(item.id, tracksList);
+  } else {
+    tracksCol.style.display = 'none';
+  }
+
+  // Results area: start searching immediately
+  const resultsArea = document.getElementById('modal-results');
+  resultsArea.innerHTML = '<div style="color:var(--t3);font-style:italic;">Connecting to Soulseek…</div>';
+
+  document.getElementById('modal-overlay').classList.add('open');
+  document.body.style.overflow = 'hidden';
+
+  startModalPreview(item.query, item.isAlbum, item.artist, resultsArea, currentAbortController.signal);
+}
+
+function closeModal() {
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null;
+  }
+  document.getElementById('modal-overlay').classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+async function loadModalTracks(mbid, container) {
+  if (trackCache[mbid]) {
+    renderTracks(container, trackCache[mbid]);
+    return;
+  }
+  try {
+    const r = await fetch(`/release-group?id=${encodeURIComponent(mbid)}`);
+    const data = await r.json();
+    const tracks = (data.media || []).flatMap(m =>
+      (m.tracks || []).map(t => ({
+        num:    t.number ?? t.position,
+        title:  t.title || t.recording?.title || '',
+        length: t.length || t.recording?.length || 0,
+      }))
+    );
+    trackCache[mbid] = tracks;
+    renderTracks(container, tracks);
+  } catch (e) {
+    container.innerHTML = '<div class="track-row" style="color:var(--err);border:none;">Failed to load tracks</div>';
+  }
+}
+
+function renderTracks(container, tracks) {
+  if (!tracks.length) {
+    container.innerHTML = '<div class="track-row" style="color:var(--t3);font-style:italic;border:none;">No tracks found</div>';
+    return;
+  }
+  container.innerHTML = tracks.map(t => `
+    <div class="track-row">
+      <span class="track-num">${esc(String(t.num))}</span>
+      <span class="track-title">${esc(t.title)}</span>
+      ${t.length ? `<span class="track-dur">${fmtDuration(t.length)}</span>` : ''}
+    </div>`).join('');
+}
+
+async function startModalPreview(query, isAlbum, artist, area, signal) {
+  const statusEl = area.querySelector('div');
+
+  try {
+    const r = await fetch('/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, album: isAlbum, subfolder: '' }),
+      signal,
+    });
+
+    const reader  = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const text = line.slice(6);
+        if (text === '[preview-done]') {
+          if (!area.querySelector('.preview-result-card')) {
+            area.innerHTML = '<span class="preview-line-err">No results found.</span>';
+          }
+          return;
+        } else if (text.startsWith('[results] ')) {
+          try {
+            const results = JSON.parse(text.slice(10));
+            renderModalResults(results, area, isAlbum, artist);
+          } catch (e) {
+            area.innerHTML = '';
+            const s = document.createElement('pre');
+            s.style.cssText = 'color:var(--err);white-space:pre-wrap;word-break:break-all;';
+            s.textContent = 'Parse error: ' + e.message;
+            area.appendChild(s);
+          }
+        } else if (text.startsWith('[results-raw] ')) {
+          area.innerHTML = '';
+          const s = document.createElement('pre');
+          s.style.cssText = 'color:var(--t2);white-space:pre-wrap;word-break:break-all;';
+          try { s.textContent = JSON.parse(text.slice(14)); }
+          catch { s.textContent = text.slice(14); }
+          area.appendChild(s);
+        } else if (text.startsWith('[log] ') && statusEl) {
+          statusEl.textContent = text.slice(6);
+        } else if (text.startsWith('[queued] ') && statusEl) {
+          statusEl.textContent = text.slice(9);
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    area.innerHTML = '';
+    const s = document.createElement('span');
+    s.className = 'preview-line-err';
+    s.textContent = 'Error: ' + e.message;
+    area.appendChild(s);
+  }
+}
+
+function renderModalResults(results, area, isAlbum, artist) {
+  area.innerHTML = '';
+
+  if (!Array.isArray(results) || results.length === 0) {
+    const s = document.createElement('span');
+    s.className = 'preview-line-err';
+    s.textContent = 'No results found.';
+    area.appendChild(s);
+    return;
+  }
+
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'color:var(--t3);margin-bottom:0.4rem;padding-bottom:0.35rem;border-bottom:1px solid var(--b1);font-size:0.68rem;letter-spacing:0.03em;';
+  hdr.textContent = `${results.length} result${results.length !== 1 ? 's' : ''} found`;
+  area.appendChild(hdr);
+
+  results.forEach(result => {
+    const username      = result.User?.Username || result.Username || result.username || '?';
+    const files         = result.Files || result.TrackFiles || result.files || [];
+    const firstFilename = (files[0]?.Filename || files[0]?.FileName || '').replace(/\\/g, '/');
+    const dir           = firstFilename.includes('/') ? firstFilename.substring(0, firstFilename.lastIndexOf('/')) : '';
+    const folderName    = dir.split('/').filter(Boolean).pop() || dir || '?';
+    const slskPath      = dir.replace(/\\/g, '/').replace(/^\/+/, '');
+    const slskLink      = `slsk://${username}/${slskPath}`;
+
+    const card = document.createElement('div');
+    card.className = 'preview-result-card';
+
+    const cardTop = document.createElement('div');
+    cardTop.style.cssText = 'display:flex;justify-content:space-between;align-items:flex-start;gap:0.5rem;margin-bottom:0.25rem;';
+
+    const info = document.createElement('div');
+    info.style.cssText = 'min-width:0;';
+
+    const userLine = document.createElement('div');
+    userLine.className = 'preview-line-user';
+    userLine.textContent = username;
+
+    const folderLine = document.createElement('div');
+    folderLine.className = 'preview-line-folder';
+    folderLine.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+    folderLine.title = dir;
+    folderLine.textContent = folderName;
+
+    info.append(userLine, folderLine);
+
+    const dlBtn = document.createElement('button');
+    dlBtn.className = 'preview-dl-btn';
+    dlBtn.textContent = '↓ Download';
+    dlBtn.style.flexShrink = '0';
+    dlBtn.onclick = () => {
+      closeModal();
+      download(slskLink, isAlbum, artist);
+    };
+
+    cardTop.append(info, dlBtn);
+    card.appendChild(cardTop);
+
+    if (files.length > 0) {
+      const fileList = document.createElement('div');
+      const shown    = files.slice(0, 20);
+      shown.forEach(f => {
+        const name    = (f.Filename || f.FileName || f.filename || f.Name || '').replace(/\\/g, '/').split('/').pop();
+        const bitrate = f.BitRate || f.Bitrate || f.bitrate || 0;
+        const length  = (f.Length || f.length || 0) * 1000;
+
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:0.5rem;justify-content:space-between;';
+
+        const nameEl = document.createElement('span');
+        nameEl.className = 'preview-line-file';
+        nameEl.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;';
+        nameEl.textContent = name;
+
+        const metaEl = document.createElement('span');
+        metaEl.style.cssText = 'color:var(--t3);flex-shrink:0;font-variant-numeric:tabular-nums;';
+        const parts = [];
+        if (bitrate) parts.push(`${bitrate}k`);
+        if (length)  parts.push(fmtDuration(length));
+        metaEl.textContent = parts.join(' ');
+
+        row.append(nameEl, metaEl);
+        fileList.appendChild(row);
+      });
+      if (files.length > 20) {
+        const more = document.createElement('div');
+        more.style.color = 'var(--t3)';
+        more.textContent = `…and ${files.length - 20} more`;
+        fileList.appendChild(more);
+      }
+      card.appendChild(fileList);
+    }
+
+    area.appendChild(card);
+  });
+}
+
+function fmtDuration(ms) {
+  const s = Math.round(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function esc(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function clearAll() {
+  document.getElementById('panels').innerHTML = '';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('q-artist').value = '';
+  document.getElementById('q-title').value = '';
+}
+
+function closePanel(id) {
+  document.getElementById(id)?.remove();
+}
+
+async function download(query, album, subfolder) {
+  const id    = Date.now();
+  const panel = document.createElement('div');
+  panel.className = 'panel';
+  panel.id = `panel-${id}`;
+  panel.innerHTML = `
+    <div class="panel-header">
+      <span class="panel-query">${esc(query)}</span>
+      <div class="panel-header-right">
+        <span class="status" id="status-${id}">running</span>
+        <button class="panel-close" onclick="closePanel('panel-${id}')" title="Close">×</button>
+      </div>
+    </div>
+    <div class="terminal" id="term-${id}"></div>
+  `;
+  document.getElementById('panels').prepend(panel);
+
+  const term   = document.getElementById(`term-${id}`);
+  const status = document.getElementById(`status-${id}`);
+
+  try {
+    const r = await fetch('/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, album, subfolder }),
+    });
+
+    const reader  = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const text = line.slice(6);
+
+        if (text === '[done]') {
+          status.textContent = 'done';
+          status.className   = 'status done';
+        } else if (text.startsWith('[saved] ')) {
+          const s = document.createElement('span');
+          s.className = 'line-ok';
+          s.textContent = 'Saved: ' + text.slice(8) + '\n';
+          term.appendChild(s);
+        } else if (text.startsWith('[beets] ')) {
+          const s = document.createElement('span');
+          s.className = 'line-beets';
+          s.textContent = text + '\n';
+          term.appendChild(s);
+        } else if (text.startsWith('[queued] ')) {
+          status.textContent = 'queued';
+          status.className   = 'status';
+          const s = document.createElement('span');
+          s.textContent = text.slice(9) + '\n';
+          term.appendChild(s);
+        } else if (text.startsWith('[error-detail] ')) {
+          const s = document.createElement('span');
+          s.className = 'line-error';
+          s.textContent = '  ' + text.slice(15) + '\n';
+          term.appendChild(s);
+        } else if (text.startsWith('[error]')) {
+          status.textContent = 'error';
+          status.className   = 'status error';
+          const s = document.createElement('span');
+          s.className = 'line-error';
+          s.textContent = text + '\n';
+          term.appendChild(s);
+        } else {
+          const s  = document.createElement('span');
+          const lo = text.toLowerCase();
+          if (/fail|error|not found|no result|unable|timeout/.test(lo)) s.className = 'line-error';
+          else if (/warn|skip/.test(lo)) s.className = 'line-warn';
+          else if (/done|saved|success|complete/.test(lo)) s.className = 'line-ok';
+          s.textContent = text + '\n';
+          term.appendChild(s);
+        }
+        term.scrollTop = term.scrollHeight;
+      }
+    }
+  } catch (e) {
+    status.textContent = 'error';
+    status.className   = 'status error';
+    term.textContent  += `\nFetch error: ${e.message}\n`;
+  }
+}
+</script>
+</body>
+</html>

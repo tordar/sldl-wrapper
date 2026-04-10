@@ -1,0 +1,12 @@
+services:
+  sldl-wrapper:
+    build: .
+    ports:
+      - "6060:8080"
+    volumes:
+      - /volume1/MyDrive/Music/Music:/music
+      - /volume1/docker/sldl-wrapper/static:/static
+    environment:
+      - SLDL_USER=${SLDL_USER}
+      - SLDL_PASS=${SLDL_PASS}
+    restart: unless-stopped
