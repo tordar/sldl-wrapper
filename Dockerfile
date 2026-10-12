@@ -5,15 +5,14 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o sldl-wrapper .
 
 FROM debian:bookworm-slim
+# System packages come before the app COPYs so code changes reuse this cached
+# layer. sldl itself is not baked in: docker-compose mounts it at /sldl/sldl.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libicu72 \
+        beets python3-mutagen python3-requests && \
+    rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/sldl-wrapper /sldl-wrapper
 COPY --from=builder /app/static /static
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates libicu72 curl unzip \
-        beets python3-mutagen python3-requests && \
-    curl -fsSL "https://github.com/fiso64/sldl/releases/download/v2.6.0/sldl_linux-x64.zip" -o /tmp/sldl.zip && \
-    unzip /tmp/sldl.zip sldl -d /sldl && \
-    chmod +x /sldl/sldl && \
-    rm -rf /tmp/sldl.zip /var/lib/apt/lists/*
 WORKDIR /
 EXPOSE 8080
 ENTRYPOINT ["/sldl-wrapper"]

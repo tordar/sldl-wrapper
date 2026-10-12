@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +26,10 @@ const (
 	// sldl tolerance: 10 min per stalled track instead of sldl's ~50s default.
 	// Soulseek users with queues / no slots often deliver eventually.
 	sldlMaxStaleTime = "600000"
+
+	// minBitrate is the default hard floor for downloads. Previews search without
+	// it so the UI can offer lower-bitrate results when nothing reaches it.
+	minBitrate = "320"
 )
 
 var errorKeywords = []string{"fail", "error", "no result", "not found", "unable", "warning", "timeout", "connect"}
@@ -105,9 +111,13 @@ func sanitizeQuery(q string) string {
 }
 
 // buildSldlArgs constructs the common sldl invocation. If outDir is empty the
-// --path flag is omitted (used by preview, which doesn't write to disk).
-func buildSldlArgs(username, password, outDir, query string, isAlbum bool, extra ...string) []string {
-	args := []string{"--username", username, "--password", password, "--min-bitrate", "320", "--max-stale-time", sldlMaxStaleTime}
+// --path flag is omitted (used by preview, which doesn't write to disk); if
+// bitrate is empty no --min-bitrate floor is applied.
+func buildSldlArgs(username, password, outDir, query, bitrate string, isAlbum bool, extra ...string) []string {
+	args := []string{"--username", username, "--password", password, "--max-stale-time", sldlMaxStaleTime}
+	if bitrate != "" {
+		args = append(args, "--min-bitrate", bitrate)
+	}
 	if outDir != "" {
 		args = append(args, "--path", outDir)
 	}
@@ -394,7 +404,7 @@ func handleReleaseGroup(w http.ResponseWriter, r *http.Request) {
 
 func handleQueueStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"queued":%d}`, len(jobQueue))
+	fmt.Fprintf(w, `{"queued":%d,"downloads":%d}`, len(jobQueue), downloadsPending.Load())
 }
 
 const promoStripScript = `
@@ -571,7 +581,19 @@ type DownloadRequest struct {
 	Query     string `json:"query"`
 	Album     bool   `json:"album"`
 	Subfolder string `json:"subfolder"`
+	// LowBitrate drops the minBitrate floor, for when the user picked a
+	// below-320 result because nothing better was available.
+	LowBitrate bool `json:"lowBitrate"`
 }
+
+// downloadMu serializes whole download pipelines (sldl, fallback retry, beets).
+// findSavedAlbums finds a download's album by file mtimes, so the next sldl run
+// must not start while beets is still rewriting the previous album's tags, or
+// that album would be picked up (and the new one missed).
+var (
+	downloadMu       sync.Mutex
+	downloadsPending atomic.Int32
+)
 
 func handlePreview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -596,7 +618,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	args := buildSldlArgs(username, password, "", req.Query, req.Album, "--print", "json-all")
+	args := buildSldlArgs(username, password, "", req.Query, "", req.Album, "--print", "json-all")
 
 	// A preview is only useful to the client that asked, so it dies with the request.
 	job := &DownloadJob{
@@ -704,8 +726,21 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	bitrate := minBitrate
+	if req.LowBitrate {
+		bitrate = ""
+	}
+
 	serveSSE(w, r, func(emit emitFunc) {
-		args := buildSldlArgs(username, password, outDir, req.Query, req.Album)
+		ahead := downloadsPending.Add(1) - 1
+		defer downloadsPending.Add(-1)
+		if ahead > 0 {
+			emit("[queued] %d download(s) ahead — waiting...", ahead)
+		}
+		downloadMu.Lock()
+		defer downloadMu.Unlock()
+
+		args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album)
 		sigLines, startTime, exitErr := runSldlAndStream(emit, args, outDir)
 
 		saved := findSavedAlbums(outDir, startTime)
@@ -720,7 +755,7 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 
 				emit("[fallback] direct URL failed; retrying with search %q", fallbackQuery)
 
-				retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, req.Album)
+				retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, bitrate, req.Album)
 				retrySig, retryStart, retryErr := runSldlAndStream(emit, retryArgs, outDir)
 				sigLines = append(sigLines, retrySig...)
 				saved = findSavedAlbums(outDir, retryStart)
