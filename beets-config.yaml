@@ -1,0 +1,26 @@
+directory: /music
+library: /data/beets-library.db
+
+import:
+  move: no
+  copy: no
+  write: yes
+  timid: no
+  incremental: no
+  log: /data/beets-import.log
+  quiet_fallback: skip
+
+match:
+  strong_rec_thresh: 0.90
+  medium_rec_thresh: 0.75
+  preferred:
+    countries: []
+    media: []
+
+plugins: fetchart embedart
+
+fetchart:
+  auto: yes
+
+embedart:
+  auto: yes

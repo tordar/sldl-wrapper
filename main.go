@@ -20,9 +20,23 @@ const (
 	musicDir   = "/music"
 	mbBase     = "https://musicbrainz.org/ws/2"
 	userAgent  = "sldl-wrapper/1.0 (https://github.com/example/sldl-wrapper)"
+
+	// sldl tolerance: 10 min per stalled track instead of sldl's ~50s default.
+	// Soulseek users with queues / no slots often deliver eventually.
+	sldlMaxStaleTime = "600000"
 )
 
 var errorKeywords = []string{"fail", "error", "no result", "not found", "unable", "warning", "timeout", "connect"}
+
+var audioExt = map[string]bool{
+	".mp3":  true,
+	".flac": true,
+	".m4a":  true,
+	".ogg":  true,
+	".opus": true,
+	".wav":  true,
+	".aac":  true,
+}
 
 func isSignificant(line string) bool {
 	lower := strings.ToLower(line)
@@ -84,6 +98,142 @@ func jobWorker() {
 
 // --- HTTP handlers ---
 
+func sanitizeQuery(q string) string {
+	q = strings.ReplaceAll(q, " & ", " ")
+	q = strings.ReplaceAll(q, "&", " ")
+	return strings.TrimSpace(q)
+}
+
+// buildSldlArgs constructs the common sldl invocation. If outDir is empty the
+// --path flag is omitted (used by preview, which doesn't write to disk).
+func buildSldlArgs(username, password, outDir, query string, isAlbum bool, extra ...string) []string {
+	args := []string{"--username", username, "--password", password, "--min-bitrate", "320", "--max-stale-time", sldlMaxStaleTime}
+	if outDir != "" {
+		args = append(args, "--path", outDir)
+	}
+	args = append(args, extra...)
+	if isAlbum {
+		args = append(args, "--album")
+	}
+	args = append(args, sanitizeQuery(query))
+	return args
+}
+
+// pathContainsFailed reports whether any path segment of rel is "failed" (case-insensitive).
+func pathContainsFailed(rel string) bool {
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if strings.EqualFold(part, "failed") {
+			return true
+		}
+	}
+	return false
+}
+
+// findSavedAlbums returns directories under outDir that contain audio files modified
+// after startTime and are NOT inside a "failed/" subtree.
+func findSavedAlbums(outDir string, startTime time.Time) []string {
+	return scanForAudioDirs(outDir, startTime, false)
+}
+
+// findFailedAlbums returns directories inside a "failed/" subtree that contain
+// audio files modified after startTime.
+func findFailedAlbums(outDir string, startTime time.Time) []string {
+	return scanForAudioDirs(outDir, startTime, true)
+}
+
+func scanForAudioDirs(outDir string, startTime time.Time, wantFailed bool) []string {
+	var out []string
+	filepath.WalkDir(outDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		rel, _ := filepath.Rel(outDir, path)
+		if rel == "." {
+			return nil
+		}
+		inFailed := pathContainsFailed(rel)
+		if wantFailed != inFailed {
+			return nil
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			if !audioExt[strings.ToLower(filepath.Ext(e.Name()))] {
+				continue
+			}
+			info, err := e.Info()
+			if err == nil && info.ModTime().After(startTime) {
+				out = append(out, path)
+				return filepath.SkipDir
+			}
+		}
+		return nil
+	})
+	return out
+}
+
+// removeFailedParents finds the "failed" ancestor of each given path under outDir
+// and removes it. Used to clean up sldl's failed/<album>/ residue before retrying.
+func removeFailedParents(outDir string, failedAlbums []string, log func(string)) {
+	seen := map[string]bool{}
+	for _, fdir := range failedAlbums {
+		cur := fdir
+		for {
+			if cur == outDir || cur == "/" || cur == "." {
+				break
+			}
+			if strings.EqualFold(filepath.Base(cur), "failed") {
+				if !seen[cur] {
+					seen[cur] = true
+					if err := os.RemoveAll(cur); err == nil {
+						log(fmt.Sprintf("[cleanup] removed %s", cur))
+					} else {
+						log(fmt.Sprintf("[cleanup] could not remove %s: %v", cur, err))
+					}
+				}
+				break
+			}
+			cur = filepath.Dir(cur)
+		}
+	}
+}
+
+// parseSlskURL extracts a search query "Artist Album" from a slsk://USER/PATH URL.
+// Returns ("", false) if the URL isn't usable as a fallback.
+func parseSlskURL(q string) (string, bool) {
+	if !strings.HasPrefix(q, "slsk://") {
+		return "", false
+	}
+	u, err := url.Parse(q)
+	if err != nil {
+		return "", false
+	}
+	var parts []string
+	for _, p := range strings.Split(u.Path, "/") {
+		if p == "" {
+			continue
+		}
+		low := strings.ToLower(p)
+		// drop generic library-root names so the search isn't poisoned by them
+		if low == "beets" || low == "music" || low == "shared" || low == "downloads" || low == "complete" {
+			continue
+		}
+		parts = append(parts, p)
+	}
+	if len(parts) == 0 {
+		return "", false
+	}
+	if len(parts) >= 2 {
+		return parts[len(parts)-2] + " " + parts[len(parts)-1], true
+	}
+	return parts[0], true
+}
+
 func main() {
 	http.HandleFunc("/", serveIndex)
 	http.HandleFunc("/search", handleSearch)
@@ -122,7 +272,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		endpoint = "/recording/"
 	}
 
-	mbURL := fmt.Sprintf("%s%s?query=%s&fmt=json&limit=20", mbBase, endpoint, url.QueryEscape(q))
+	mbURL := fmt.Sprintf("%s%s?query=%s&fmt=json&limit=50", mbBase, endpoint, url.QueryEscape(q))
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, mbURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -174,7 +324,6 @@ func handleReleaseGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch the release group to get its list of releases
 	rgURL := fmt.Sprintf("%s/release-group/%s?inc=releases&fmt=json", mbBase, url.PathEscape(id))
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, rgURL, nil)
 	if err != nil {
@@ -201,7 +350,6 @@ func handleReleaseGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pick canonical release: earliest Official, then earliest any
 	picked := ""
 	pickedDate := ""
 	for _, rel := range rg.Releases {
@@ -226,7 +374,6 @@ func handleReleaseGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Fetch recordings for the chosen release
 	relURL := fmt.Sprintf("%s/release/%s?inc=recordings&fmt=json", mbBase, url.PathEscape(picked))
 	req2, err := http.NewRequestWithContext(r.Context(), http.MethodGet, relURL, nil)
 	if err != nil {
@@ -409,11 +556,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	args := []string{"--username", username, "--password", password, "--print", "json-all", "--min-bitrate", "320"}
-	if req.Album {
-		args = append(args, "--album")
-	}
-	args = append(args, req.Query)
+	args := buildSldlArgs(username, password, "", req.Query, req.Album, "--print", "json-all")
 
 	job := &DownloadJob{
 		cmd:     exec.CommandContext(r.Context(), sldlBinary, args...),
@@ -439,7 +582,6 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 
 	jobQueue <- job
 
-	// Stream all lines as log events AND collect for JSON extraction
 	var allLines []string
 	for line := range job.output {
 		allLines = append(allLines, line)
@@ -448,7 +590,6 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	<-job.exitErr
 
-	// Find the JSON block: try parsing from each '[' or '{' in full output
 	fullOutput := strings.Join(allLines, "\n")
 	jsonFound := false
 	for i, ch := range fullOutput {
@@ -468,6 +609,37 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "data: [preview-done]\n\n")
 	flusher.Flush()
+}
+
+// runSldlAndStream pushes a sldl invocation through the worker queue, streams
+// its stdout/stderr to the SSE writer, and returns the collected significant
+// error lines plus the exit error.
+func runSldlAndStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
+	job := &DownloadJob{
+		cmd:     exec.CommandContext(r.Context(), sldlBinary, args...),
+		outDir:  outDir,
+		output:  make(chan string, 200),
+		exitErr: make(chan error, 1),
+	}
+
+	queueLen := len(jobQueue)
+	if queueLen > 0 {
+		fmt.Fprintf(w, "data: [queued] %d download(s) ahead — waiting...\n\n", queueLen)
+		flusher.Flush()
+	}
+
+	jobQueue <- job
+
+	for line := range job.output {
+		if isSignificant(line) {
+			sigLines = append(sigLines, line)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", line)
+		flusher.Flush()
+	}
+	exitErr = <-job.exitErr
+	startTime = job.startTime
+	return
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -502,19 +674,6 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	args := []string{"--username", username, "--password", password, "--path", outDir, "--min-bitrate", "320"}
-	if req.Album {
-		args = append(args, "--album")
-	}
-	args = append(args, req.Query)
-
-	job := &DownloadJob{
-		cmd:     exec.CommandContext(r.Context(), sldlBinary, args...),
-		outDir:  outDir,
-		output:  make(chan string, 200),
-		exitErr: make(chan error, 1),
-	}
-
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -524,36 +683,39 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queueLen := len(jobQueue)
-	if queueLen > 0 {
-		fmt.Fprintf(w, "data: [queued] %d download(s) ahead — waiting...\n\n", queueLen)
-		flusher.Flush()
+	args := buildSldlArgs(username, password, outDir, req.Query, req.Album)
+	sigLines, startTime, exitErr := runSldlAndStream(w, flusher, r, args, outDir)
+
+	saved := findSavedAlbums(outDir, startTime)
+
+	// If the direct sldl run produced no usable album (most often because a
+	// slsk:// URL pinned us to one offline / slot-starved user), fall back to
+	// a name-based search so sldl can pick any seeder.
+	if len(saved) == 0 {
+		if fallbackQuery, ok := parseSlskURL(req.Query); ok {
+			failed := findFailedAlbums(outDir, startTime)
+			removeFailedParents(outDir, failed, func(msg string) {
+				fmt.Fprintf(w, "data: %s\n\n", msg)
+				flusher.Flush()
+			})
+
+			fmt.Fprintf(w, "data: [fallback] direct URL failed; retrying with search %q\n\n", fallbackQuery)
+			flusher.Flush()
+
+			retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, req.Album)
+			var retrySig []string
+			var retryStart time.Time
+			var retryErr error
+			retrySig, retryStart, retryErr = runSldlAndStream(w, flusher, r, retryArgs, outDir)
+			sigLines = append(sigLines, retrySig...)
+			saved = findSavedAlbums(outDir, retryStart)
+			if len(saved) == 0 && retryErr != nil {
+				exitErr = retryErr
+			} else if len(saved) > 0 {
+				exitErr = nil
+			}
+		}
 	}
-
-	jobQueue <- job
-
-	var sigLines []string
-	for line := range job.output {
-		if isSignificant(line) {
-			sigLines = append(sigLines, line)
-		}
-		fmt.Fprintf(w, "data: %s\n\n", line)
-		flusher.Flush()
-	}
-
-	exitErr := <-job.exitErr
-
-	var saved []string
-	filepath.WalkDir(job.outDir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || !d.IsDir() || path == job.outDir {
-			return nil
-		}
-		info, err := d.Info()
-		if err == nil && info.ModTime().After(job.startTime) {
-			saved = append(saved, path)
-		}
-		return nil
-	})
 
 	if exitErr != nil && len(saved) == 0 {
 		fmt.Fprintf(w, "data: [error] sldl exited: %v\n\n", exitErr)

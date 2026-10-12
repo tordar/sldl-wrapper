@@ -6,6 +6,9 @@ services:
     volumes:
       - /volume1/MyDrive/Music/Music:/music
       - /volume1/docker/sldl-wrapper/static:/static
+      - /volume1/docker/sldl-wrapper/beets-config.yaml:/etc/beets/config.yaml:ro
+      - /volume1/docker/sldl-wrapper/data:/data
+      - /volume1/docker/sldl-wrapper/sldl:/sldl/sldl:ro
     environment:
       - SLDL_USER=${SLDL_USER}
       - SLDL_PASS=${SLDL_PASS}

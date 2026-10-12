@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>sldl</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -105,7 +105,7 @@ input[type="text"] {
   border-radius: 6px;
   color: var(--t1);
   font-family: var(--fu);
-  font-size: 0.88rem;
+  font-size: 16px;
   outline: none;
   transition: border-color 0.15s, background 0.15s;
 }
@@ -256,6 +256,26 @@ button.search-btn:hover { background: var(--a2); }
   padding: 2.5rem 0;
   grid-column: 1 / -1;
 }
+
+.group-hdr {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.4rem;
+  color: var(--t3);
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+.group-hdr::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--b1);
+}
+.group-hdr:first-child { margin-top: 0; }
 
 /* ── RESULT CARD ── */
 @keyframes fadeUp {
@@ -568,7 +588,11 @@ button.search-btn:hover { background: var(--a2); }
   .search-inputs { flex-basis: 100%; }
   .search-controls { flex-basis: 100%; }
   button.search-btn { flex: 1; }
-  #results { grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 0.6rem; }
+  #results { grid-template-columns: repeat(3, 1fr); gap: 0.4rem; }
+  .result-body { padding: 0.45rem 0.5rem 0.3rem; }
+  .result-title { font-size: 0.78rem; }
+  .result-meta { font-size: 0.64rem; }
+  .result-meta2, .tag { display: none; }
 
   #panels { width: calc(100% - 2rem); right: 1rem; left: 1rem; }
   .modal-tracks-col { display: none; }
@@ -709,13 +733,40 @@ function renderResults(data, type) {
     });
   }
 
+  if (type !== 'track') {
+    // Albums first, then EPs, singles, live, compilations. A secondary type
+    // (Live, Compilation, Demo…) demotes a release out of the plain-album group.
+    const typeRank = { album: 0, ep: 1, single: 2, live: 3, compilation: 4 };
+    const releaseRank = item => {
+      const types = [item.releaseType, ...(item.secondaryTypes || [])]
+        .filter(Boolean).map(t => t.toLowerCase());
+      if (!types.length) return 6;
+      return Math.max(...types.map(t => typeRank[t] ?? 5));
+    };
+    const groupLabels = ['Albums', 'EPs', 'Singles', 'Live', 'Compilations', 'Other', 'Other'];
+    items.forEach(it => { it.group = groupLabels[releaseRank(it)]; });
+    items.sort((a, b) => {
+      const r = releaseRank(a) - releaseRank(b);
+      if (r) return r;
+      return (b.year || 0) - (a.year || 0);
+    });
+  }
+
   if (!items.length) {
     res.innerHTML = '<div class="empty">No results.</div>';
     return;
   }
 
   res.innerHTML = '';
+  let lastGroup = null;
   items.forEach((item, i) => {
+    if (item.group && item.group !== lastGroup) {
+      lastGroup = item.group;
+      const hdr = document.createElement('div');
+      hdr.className = 'group-hdr';
+      hdr.textContent = item.group;
+      res.appendChild(hdr);
+    }
     const key = item.id || String(i);
 
     const tags = [];
