@@ -11,8 +11,9 @@ import:
   quiet_fallback: skip
 
 match:
-  strong_rec_thresh: 0.90
-  medium_rec_thresh: 0.75
+  # Distances, lower = closer. 0.04 is the beets default; anything looser
+  # auto-applies wrong releases because import runs with -q (no prompts).
+  strong_rec_thresh: 0.04
   preferred:
     countries: []
     media: []

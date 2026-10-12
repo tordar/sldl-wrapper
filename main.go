@@ -439,14 +439,64 @@ for f in glob.glob(os.path.join(d, '**', '*.mp3'), recursive=True) + glob.glob(o
 print('Stripped promo text from ' + str(count) + ' file(s)')
 `
 
-func runPromoStrip(w http.ResponseWriter, flusher http.Flusher, dir string) {
-	fmt.Fprintf(w, "data: [beets] Stripping promo tags...\n\n")
-	flusher.Flush()
+// --- SSE streaming ---
+
+// emitFunc sends one SSE "data:" line to the client.
+type emitFunc func(format string, a ...any)
+
+// sseWriteTimeout bounds each write so a phone that silently dropped off the
+// network is treated as gone instead of stalling the pipeline until TCP gives up.
+const sseWriteTimeout = 30 * time.Second
+
+// serveSSE runs work in its own goroutine and streams what it emits to the
+// client. If the client goes away, work keeps running and its output is
+// discarded, so closing the tab never kills or stalls a download.
+func serveSSE(w http.ResponseWriter, r *http.Request, work func(emit emitFunc)) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	rc := http.NewResponseController(w)
+
+	events := make(chan string, 200)
+	gone := make(chan struct{})
+	emit := func(format string, a ...any) {
+		select {
+		case events <- fmt.Sprintf(format, a...):
+		case <-gone:
+		}
+	}
+	go func() {
+		defer close(events)
+		work(emit)
+	}()
+
+	defer close(gone)
+	for {
+		select {
+		case msg, ok := <-events:
+			if !ok {
+				return
+			}
+			rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", msg); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func runPromoStrip(emit emitFunc, dir string) {
+	emit("[beets] Stripping promo tags...")
 
 	cmd := exec.Command("python3", "-c", promoStripScript, dir)
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		fmt.Fprintf(w, "data: [beets] promo strip error: %v\n\n", err)
+		emit("[beets] promo strip error: %v", err)
 		return
 	}
 	cmd.Stdout = pw
@@ -454,26 +504,26 @@ func runPromoStrip(w http.ResponseWriter, flusher http.Flusher, dir string) {
 	if err := cmd.Start(); err != nil {
 		pw.Close()
 		pr.Close()
-		fmt.Fprintf(w, "data: [beets] promo strip error: %v\n\n", err)
+		emit("[beets] promo strip error: %v", err)
 		return
 	}
 	pw.Close()
 	scanner := bufio.NewScanner(pr)
 	for scanner.Scan() {
-		fmt.Fprintf(w, "data: [beets] %s\n\n", scanner.Text())
-		flusher.Flush()
+		emit("[beets] %s", scanner.Text())
 	}
 	cmd.Wait()
 }
 
-func runBeets(w http.ResponseWriter, flusher http.Flusher, dir string) {
-	fmt.Fprintf(w, "data: [beets] Auto-tagging with beets...\n\n")
-	flusher.Flush()
+func runBeets(emit emitFunc, dir string) {
+	emit("[beets] Auto-tagging with beets...")
 
-	cmd := exec.Command("beet", "--config=/etc/beets/config.yaml", "import", "-A", dir)
+	// -q: never prompt; apply confident MusicBrainz matches, otherwise fall
+	// back to import.quiet_fallback. (-A would be --noautotag.)
+	cmd := exec.Command("beet", "--config=/etc/beets/config.yaml", "import", "-q", dir)
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		fmt.Fprintf(w, "data: [beets] Could not start beets: %v\n\n", err)
+		emit("[beets] Could not start beets: %v", err)
 		return
 	}
 	cmd.Stdout = pw
@@ -481,22 +531,20 @@ func runBeets(w http.ResponseWriter, flusher http.Flusher, dir string) {
 	if err := cmd.Start(); err != nil {
 		pw.Close()
 		pr.Close()
-		fmt.Fprintf(w, "data: [beets] Could not start beets: %v\n\n", err)
+		emit("[beets] Could not start beets: %v", err)
 		return
 	}
 	pw.Close()
 
 	scanner := bufio.NewScanner(pr)
 	for scanner.Scan() {
-		fmt.Fprintf(w, "data: [beets] %s\n\n", scanner.Text())
-		flusher.Flush()
+		emit("[beets] %s", scanner.Text())
 	}
 	if err := cmd.Wait(); err != nil {
-		fmt.Fprintf(w, "data: [beets] finished with warning: %v\n\n", err)
+		emit("[beets] finished with warning: %v", err)
 	} else {
-		fmt.Fprintf(w, "data: [beets] tagging complete\n\n")
+		emit("[beets] tagging complete")
 	}
-	flusher.Flush()
 }
 
 func handleRetag(w http.ResponseWriter, r *http.Request) {
@@ -512,19 +560,11 @@ func handleRetag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
-
-	runPromoStrip(w, flusher, clean)
-	runBeets(w, flusher, clean)
-	fmt.Fprintf(w, "data: [done]\n\n")
-	flusher.Flush()
+	serveSSE(w, r, func(emit emitFunc) {
+		runPromoStrip(emit, clean)
+		runBeets(emit, clean)
+		emit("[done]")
+	})
 }
 
 type DownloadRequest struct {
@@ -558,6 +598,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 
 	args := buildSldlArgs(username, password, "", req.Query, req.Album, "--print", "json-all")
 
+	// A preview is only useful to the client that asked, so it dies with the request.
 	job := &DownloadJob{
 		cmd:     exec.CommandContext(r.Context(), sldlBinary, args...),
 		outDir:  musicDir,
@@ -565,58 +606,49 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		exitErr: make(chan error, 1),
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
+	serveSSE(w, r, func(emit emitFunc) {
+		queueLen := len(jobQueue)
+		if queueLen > 0 {
+			emit("[queued] %d job(s) ahead — waiting...", queueLen)
+		}
 
-	queueLen := len(jobQueue)
-	if queueLen > 0 {
-		fmt.Fprintf(w, "data: [queued] %d job(s) ahead — waiting...\n\n", queueLen)
-		flusher.Flush()
-	}
+		jobQueue <- job
 
-	jobQueue <- job
+		var allLines []string
+		for line := range job.output {
+			allLines = append(allLines, line)
+			emit("[log] %s", line)
+		}
+		<-job.exitErr
 
-	var allLines []string
-	for line := range job.output {
-		allLines = append(allLines, line)
-		fmt.Fprintf(w, "data: [log] %s\n\n", line)
-		flusher.Flush()
-	}
-	<-job.exitErr
-
-	fullOutput := strings.Join(allLines, "\n")
-	jsonFound := false
-	for i, ch := range fullOutput {
-		if ch == '[' || ch == '{' {
-			var raw json.RawMessage
-			if err := json.Unmarshal([]byte(fullOutput[i:]), &raw); err == nil {
-				compact, _ := json.Marshal(raw)
-				fmt.Fprintf(w, "data: [results] %s\n\n", string(compact))
-				jsonFound = true
-				break
+		fullOutput := strings.Join(allLines, "\n")
+		jsonFound := false
+		for i, ch := range fullOutput {
+			if ch == '[' || ch == '{' {
+				var raw json.RawMessage
+				if err := json.Unmarshal([]byte(fullOutput[i:]), &raw); err == nil {
+					compact, _ := json.Marshal(raw)
+					emit("[results] %s", compact)
+					jsonFound = true
+					break
+				}
 			}
 		}
-	}
-	if !jsonFound {
-		rawJSON, _ := json.Marshal(fullOutput)
-		fmt.Fprintf(w, "data: [results-raw] %s\n\n", string(rawJSON))
-	}
-	fmt.Fprintf(w, "data: [preview-done]\n\n")
-	flusher.Flush()
+		if !jsonFound {
+			rawJSON, _ := json.Marshal(fullOutput)
+			emit("[results-raw] %s", rawJSON)
+		}
+		emit("[preview-done]")
+	})
 }
 
 // runSldlAndStream pushes a sldl invocation through the worker queue, streams
-// its stdout/stderr to the SSE writer, and returns the collected significant
-// error lines plus the exit error.
-func runSldlAndStream(w http.ResponseWriter, flusher http.Flusher, r *http.Request, args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
+// its stdout/stderr through emit, and returns the collected significant error
+// lines plus the exit error. The process is deliberately not tied to the
+// request context: a download must survive the browser tab closing.
+func runSldlAndStream(emit emitFunc, args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
 	job := &DownloadJob{
-		cmd:     exec.CommandContext(r.Context(), sldlBinary, args...),
+		cmd:     exec.Command(sldlBinary, args...),
 		outDir:  outDir,
 		output:  make(chan string, 200),
 		exitErr: make(chan error, 1),
@@ -624,8 +656,7 @@ func runSldlAndStream(w http.ResponseWriter, flusher http.Flusher, r *http.Reque
 
 	queueLen := len(jobQueue)
 	if queueLen > 0 {
-		fmt.Fprintf(w, "data: [queued] %d download(s) ahead — waiting...\n\n", queueLen)
-		flusher.Flush()
+		emit("[queued] %d download(s) ahead — waiting...", queueLen)
 	}
 
 	jobQueue <- job
@@ -634,8 +665,7 @@ func runSldlAndStream(w http.ResponseWriter, flusher http.Flusher, r *http.Reque
 		if isSignificant(line) {
 			sigLines = append(sigLines, line)
 		}
-		fmt.Fprintf(w, "data: %s\n\n", line)
-		flusher.Flush()
+		emit("%s", line)
 	}
 	exitErr = <-job.exitErr
 	startTime = job.startTime
@@ -674,61 +704,48 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming not supported", http.StatusInternalServerError)
-		return
-	}
+	serveSSE(w, r, func(emit emitFunc) {
+		args := buildSldlArgs(username, password, outDir, req.Query, req.Album)
+		sigLines, startTime, exitErr := runSldlAndStream(emit, args, outDir)
 
-	args := buildSldlArgs(username, password, outDir, req.Query, req.Album)
-	sigLines, startTime, exitErr := runSldlAndStream(w, flusher, r, args, outDir)
+		saved := findSavedAlbums(outDir, startTime)
 
-	saved := findSavedAlbums(outDir, startTime)
+		// If the direct sldl run produced no usable album (most often because a
+		// slsk:// URL pinned us to one offline / slot-starved user), fall back to
+		// a name-based search so sldl can pick any seeder.
+		if len(saved) == 0 {
+			if fallbackQuery, ok := parseSlskURL(req.Query); ok {
+				failed := findFailedAlbums(outDir, startTime)
+				removeFailedParents(outDir, failed, func(msg string) { emit("%s", msg) })
 
-	// If the direct sldl run produced no usable album (most often because a
-	// slsk:// URL pinned us to one offline / slot-starved user), fall back to
-	// a name-based search so sldl can pick any seeder.
-	if len(saved) == 0 {
-		if fallbackQuery, ok := parseSlskURL(req.Query); ok {
-			failed := findFailedAlbums(outDir, startTime)
-			removeFailedParents(outDir, failed, func(msg string) {
-				fmt.Fprintf(w, "data: %s\n\n", msg)
-				flusher.Flush()
-			})
+				emit("[fallback] direct URL failed; retrying with search %q", fallbackQuery)
 
-			fmt.Fprintf(w, "data: [fallback] direct URL failed; retrying with search %q\n\n", fallbackQuery)
-			flusher.Flush()
-
-			retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, req.Album)
-			var retrySig []string
-			var retryStart time.Time
-			var retryErr error
-			retrySig, retryStart, retryErr = runSldlAndStream(w, flusher, r, retryArgs, outDir)
-			sigLines = append(sigLines, retrySig...)
-			saved = findSavedAlbums(outDir, retryStart)
-			if len(saved) == 0 && retryErr != nil {
-				exitErr = retryErr
-			} else if len(saved) > 0 {
-				exitErr = nil
+				retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, req.Album)
+				retrySig, retryStart, retryErr := runSldlAndStream(emit, retryArgs, outDir)
+				sigLines = append(sigLines, retrySig...)
+				saved = findSavedAlbums(outDir, retryStart)
+				if len(saved) == 0 && retryErr != nil {
+					exitErr = retryErr
+				} else if len(saved) > 0 {
+					exitErr = nil
+				}
 			}
 		}
-	}
 
-	if exitErr != nil && len(saved) == 0 {
-		fmt.Fprintf(w, "data: [error] sldl exited: %v\n\n", exitErr)
-		for _, l := range sigLines {
-			fmt.Fprintf(w, "data: [error-detail] %s\n\n", l)
+		// Logged as well as emitted: the client may have closed the tab long ago.
+		if exitErr != nil && len(saved) == 0 {
+			log.Printf("download %q failed: %v", req.Query, exitErr)
+			emit("[error] sldl exited: %v", exitErr)
+			for _, l := range sigLines {
+				emit("[error-detail] %s", l)
+			}
+			return
 		}
-	} else {
 		if len(saved) > 0 {
-			fmt.Fprintf(w, "data: [saved] %s\n\n", saved[0])
-			flusher.Flush()
-			runBeets(w, flusher, saved[0])
+			log.Printf("download %q saved to %s", req.Query, saved[0])
+			emit("[saved] %s", saved[0])
+			runBeets(emit, saved[0])
 		}
-		fmt.Fprintf(w, "data: [done]\n\n")
-	}
-	flusher.Flush()
+		emit("[done]")
+	})
 }

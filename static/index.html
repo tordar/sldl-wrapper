@@ -1196,9 +1196,9 @@ async function download(query, album, subfolder) {
       }
     }
   } catch (e) {
-    status.textContent = 'error';
-    status.className   = 'status error';
-    term.textContent  += `\nFetch error: ${e.message}\n`;
+    status.textContent = 'disconnected';
+    status.className   = 'status';
+    term.textContent  += `\nConnection lost (${e.message}). The download keeps running on the server.\n`;
   }
 }
 </script>
