@@ -104,10 +104,25 @@ func jobWorker() {
 
 // --- HTTP handlers ---
 
+// queryPunctuation maps MusicBrainz typography to the ASCII that shared file
+// names use; Soulseek matches words literally, so "Don’t" won't find "Don't".
+// Spaced dashes become spaces so they can't be mistaken for sldl's
+// "Artist - Album" separator.
+var queryPunctuation = strings.NewReplacer(
+	"’", "'", "‘", "'", "“", `"`, "”", `"`,
+	" – ", " ", " — ", " ",
+	"‐", "-", "‑", "-", "‒", "-", "–", "-", "—", "-",
+	"…", " ",
+	" & ", " ", "&", " ",
+)
+
+// sanitizeQuery normalizes a name search for sldl. slsk:// URLs are returned
+// untouched: they are exact user/folder paths (user names can contain "&").
 func sanitizeQuery(q string) string {
-	q = strings.ReplaceAll(q, " & ", " ")
-	q = strings.ReplaceAll(q, "&", " ")
-	return strings.TrimSpace(q)
+	if strings.HasPrefix(q, "slsk://") {
+		return q
+	}
+	return strings.Join(strings.Fields(queryPunctuation.Replace(q)), " ")
 }
 
 // buildSldlArgs constructs the common sldl invocation. If outDir is empty the
@@ -636,27 +651,46 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 
 		jobQueue <- job
 
-		var allLines []string
+		var allLines, sigLines []string
 		for line := range job.output {
 			allLines = append(allLines, line)
+			if isSignificant(line) {
+				sigLines = append(sigLines, line)
+			}
 			emit("[log] %s", line)
 		}
-		<-job.exitErr
+		exitErr := <-job.exitErr
 
 		fullOutput := strings.Join(allLines, "\n")
+		var results []json.RawMessage
 		jsonFound := false
 		for i, ch := range fullOutput {
-			if ch == '[' || ch == '{' {
-				var raw json.RawMessage
-				if err := json.Unmarshal([]byte(fullOutput[i:]), &raw); err == nil {
-					compact, _ := json.Marshal(raw)
-					emit("[results] %s", compact)
+			if ch == '[' {
+				if err := json.Unmarshal([]byte(fullOutput[i:]), &results); err == nil {
 					jsonFound = true
 					break
 				}
 			}
 		}
-		if !jsonFound {
+
+		// sldl prints nothing at all when a search comes back empty, so blank
+		// output with a clean exit is a genuine "nobody shares this".
+		switch {
+		case jsonFound:
+			log.Printf("preview %q: %d result(s)", req.Query, len(results))
+			compact, _ := json.Marshal(results)
+			emit("[results] %s", compact)
+		case exitErr != nil:
+			log.Printf("preview %q failed: %v %q", req.Query, exitErr, sigLines)
+			emit("[preview-error] sldl exited: %v", exitErr)
+			for _, l := range sigLines {
+				emit("[preview-error] %s", l)
+			}
+		case strings.TrimSpace(fullOutput) == "":
+			log.Printf("preview %q: no results", req.Query)
+			emit("[results] []")
+		default:
+			log.Printf("preview %q: unparseable output %q", req.Query, sigLines)
 			rawJSON, _ := json.Marshal(fullOutput)
 			emit("[results-raw] %s", rawJSON)
 		}

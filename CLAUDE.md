@@ -60,15 +60,17 @@ Everything lives in `main.go`. Key concepts:
 - `GET /search?q=&type=` — proxies MusicBrainz `/recording/` search, or `/release-group/` when `type=album`
 - `GET /release?id=` — proxies MusicBrainz release detail (with recordings)
 - `GET /release-group?id=` — picks the earliest Official release in the group and returns its detail (with recordings)
-- `POST /preview` — runs sldl with `--print json-all` (no actual download); extracts the JSON block from mixed output and emits it as a `[results]` SSE event
+- `POST /preview` — runs sldl with `--print json-all` (no actual download); extracts the JSON block from mixed output and emits it as a `[results]` SSE event. sldl prints *nothing* when a search is empty, so blank output + exit 0 is sent as `[results] []`; a non-zero exit becomes `[preview-error]` lines. Every preview's outcome is `log.Printf`'d
 - `POST /download` — runs sldl to download, then calls beets on the newly-created album directory. If a `slsk://` URL yields nothing, it removes sldl's `failed/` residue and retries as a name search parsed from the URL path
 - `GET /retag?path=` — strips promo tags (inline Python/mutagen script) then runs beets; path must be under `/music`
 - `GET /queue` — returns `{"queued": N}` (current depth of jobQueue)
 
 **Path safety** — `/download` validates `subfolder` doesn't escape `/music`; `/retag` validates `path` prefix against `/music`. Both use `filepath.Clean`.
 
+**Query normalization** — `sanitizeQuery` maps MusicBrainz typography (’ ‐ – … etc.) to ASCII and drops `&`, because Soulseek matches words literally. `slsk://` URLs are passed through untouched: they are exact paths and user names can contain `&`.
+
 **sldl flags** — `buildSldlArgs` always passes `--max-stale-time 600000` (10 min per stalled track; Soulseek peers with queues often deliver eventually), plus `--min-bitrate` when given one.
 
-**Bitrate floor** — downloads use `--min-bitrate 320` by default. `/preview` searches with no floor; the UI (`renderModalResults`) shows only results whose lowest audio-file bitrate is ≥320 (unknown bitrate counts as passing, like sldl), and only if there are none shows the lower ones sorted best-first. Downloading one of those sends `lowBitrate: true`, which drops the floor for that download and its fallback retry.
+**Bitrate floor** — downloads use `--min-bitrate 320` by default. `/preview` searches with no floor; the UI (`renderModalResults`) shows only results whose lowest audio-file bitrate is ≥320 and that have at least half the tracks of the largest result (so one song in a compilation folder doesn't hide a full lower-bitrate album) (unknown bitrate counts as passing, like sldl), and only if there are none shows the lower ones sorted best-first. Downloading one of those sends `lowBitrate: true`, which drops the floor for that download and its fallback retry.
 
 **Post-download tagging flow**: after sldl finishes, `handleDownload` walks `outDir` for directories with audio files newer than `job.startTime` (skipping `failed/` subtrees), then passes the first match to `runBeets`. `runBeets` runs `beet import -q <dir>`: quiet mode, applies confident MusicBrainz matches and otherwise follows `quiet_fallback: skip`. Don't use `-A`; that is `--noautotag`. Files are tagged in place (`move: no`, `copy: no`). In `beets-config.yaml`, `strong_rec_thresh` is a distance (lower = stricter), so keep it near the 0.04 default.

@@ -954,10 +954,18 @@ async function startModalPreview(query, isAlbum, artist, area, signal) {
         if (!line.startsWith('data: ')) continue;
         const text = line.slice(6);
         if (text === '[preview-done]') {
-          if (!area.querySelector('.preview-result-card')) {
+          // Only fill in when nothing was rendered: results, raw output and
+          // errors must stay visible.
+          if (statusEl && area.contains(statusEl)) {
             area.innerHTML = '<span class="preview-line-err">No results found.</span>';
           }
           return;
+        } else if (text.startsWith('[preview-error] ')) {
+          if (statusEl && area.contains(statusEl)) area.innerHTML = '';
+          const s = document.createElement('div');
+          s.className = 'preview-line-err';
+          s.textContent = text.slice(16);
+          area.appendChild(s);
         } else if (text.startsWith('[results] ')) {
           try {
             const results = JSON.parse(text.slice(10));
@@ -996,12 +1004,15 @@ async function startModalPreview(query, isAlbum, artist, area, signal) {
 const MIN_BITRATE = 320;
 const AUDIO_RE = /\.(mp3|flac|m4a|ogg|opus|wav|aac|alac|ape|wv)$/i;
 
+function resultAudioFiles(result) {
+  const files = result.Files || result.TrackFiles || result.files || [];
+  return files.filter(f => AUDIO_RE.test(f.Filename || f.FileName || f.filename || f.Name || ''));
+}
+
 // Lowest known bitrate across a result's audio files, or null when none is
 // reported (typically lossless), which counts as passing, same as sldl does.
 function resultMinBitrate(result) {
-  const files = result.Files || result.TrackFiles || result.files || [];
-  const rates = files
-    .filter(f => AUDIO_RE.test(f.Filename || f.FileName || f.filename || f.Name || ''))
+  const rates = resultAudioFiles(result)
     .map(f => f.BitRate || f.Bitrate || f.bitrate || 0)
     .filter(b => b > 0);
   return rates.length ? Math.min(...rates) : null;
@@ -1013,20 +1024,25 @@ function renderModalResults(results, area, isAlbum, artist) {
   if (!Array.isArray(results) || results.length === 0) {
     const s = document.createElement('span');
     s.className = 'preview-line-err';
-    s.textContent = 'No results found.';
+    s.textContent = 'Nobody on Soulseek is sharing this right now.';
     area.appendChild(s);
     return;
   }
 
   // Show only 320k+ results when there are any; otherwise fall back to the
   // lower-bitrate ones, best first, and download those without the floor.
+  // A result with under half the tracks of the biggest one (e.g. one song in
+  // a compilation folder) doesn't count as a 320k+ copy of the album.
+  const maxTracks = Math.max(...results.map(r => resultAudioFiles(r).length));
+  const complete  = r => resultAudioFiles(r).length * 2 >= maxTracks;
   const good = results.filter(r => {
     const b = resultMinBitrate(r);
-    return b === null || b >= MIN_BITRATE;
+    return complete(r) && (b === null || b >= MIN_BITRATE);
   });
   const lowBitrate = good.length === 0;
   if (lowBitrate) {
-    results = [...results].sort((a, b) => (resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0));
+    results = [...results].sort((a, b) =>
+      (complete(b) - complete(a)) || ((resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0)));
   } else {
     results = good;
   }
