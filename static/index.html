@@ -895,10 +895,11 @@ function openModal(item) {
   // Tracks col: albums only
   const tracksCol = document.getElementById('modal-tracks-col');
   const tracksList = document.getElementById('modal-tracks');
+  let tracksPromise = Promise.resolve([]);
   if (item.isAlbum && item.id) {
     tracksCol.style.display = '';
     tracksList.innerHTML = '<div class="track-row" style="color:var(--t3);font-style:italic;border:none;">Loading…</div>';
-    loadModalTracks(item.id, tracksList);
+    tracksPromise = loadModalTracks(item.id, tracksList);
   } else {
     tracksCol.style.display = 'none';
   }
@@ -910,7 +911,7 @@ function openModal(item) {
   document.getElementById('modal-overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
 
-  startModalPreview(item.query, item.isAlbum, item.artist, resultsArea, currentAbortController.signal);
+  startModalPreview(item.query, item.isAlbum, item.artist, tracksPromise, resultsArea, currentAbortController.signal);
 }
 
 function closeModal() {
@@ -925,7 +926,7 @@ function closeModal() {
 async function loadModalTracks(mbid, container) {
   if (trackCache[mbid]) {
     renderTracks(container, trackCache[mbid]);
-    return;
+    return trackCache[mbid];
   }
   try {
     const r = await fetch(`/release-group?id=${encodeURIComponent(mbid)}`);
@@ -939,8 +940,10 @@ async function loadModalTracks(mbid, container) {
     );
     trackCache[mbid] = tracks;
     renderTracks(container, tracks);
+    return tracks;
   } catch (e) {
     container.innerHTML = '<div class="track-row" style="color:var(--err);border:none;">Failed to load tracks</div>';
+    return [];
   }
 }
 
@@ -957,7 +960,7 @@ function renderTracks(container, tracks) {
     </div>`).join('');
 }
 
-async function startModalPreview(query, isAlbum, artist, area, signal) {
+async function startModalPreview(query, isAlbum, artist, tracksPromise, area, signal) {
   const statusEl = area.querySelector('div');
 
   try {
@@ -997,7 +1000,9 @@ async function startModalPreview(query, isAlbum, artist, area, signal) {
         } else if (text.startsWith('[results] ')) {
           try {
             const results = JSON.parse(text.slice(10));
-            renderModalResults(results, area, isAlbum, artist);
+            const tracks  = await tracksPromise;
+            if (signal.aborted) return;
+            renderModalResults(results, area, isAlbum, artist, query, tracks);
           } catch (e) {
             area.innerHTML = '';
             const s = document.createElement('pre');
@@ -1046,7 +1051,38 @@ function resultMinBitrate(result) {
   return rates.length ? Math.min(...rates) : null;
 }
 
-function renderModalResults(results, area, isAlbum, artist) {
+// Title key for matching files against the MusicBrainz tracklist: bracketed
+// extras ("(feat. X)", "[Remastered]") dropped, then letters/digits only, so
+// "Yeah!? What's It Tuba!?" and "03 Yeah!- What's It Tuba!.mp3" line up.
+// Keep in sync with normTitle in main.go.
+function normTitle(s) {
+  return s.toLowerCase().replace(/\([^)]*\)|\[[^\]]*\]/g, '').replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+// How many tracklist entries have a file in this result. A file matches when
+// its name (minus extension and leading track number) is, starts with or ends
+// with the title, and its length is within 7s when both are known. Each file
+// counts once. Keep in sync with countTrackMatches in main.go.
+function countTrackMatches(result, tracks) {
+  const files = resultAudioFiles(result).map(f => {
+    const name = (f.Filename || f.FileName || f.filename || f.Name || '').replace(/\\/g, '/').split('/').pop();
+    return { key: normTitle(name.replace(/\.[^.]+$/, '')).replace(/^\d+/, ''), len: f.Length || f.length || 0 };
+  });
+  const used = new Set();
+  let matched = 0;
+  for (const t of tracks) {
+    const title = normTitle(t.title);
+    if (!title) continue;
+    const want = Math.round((t.length || 0) / 1000);
+    const i = files.findIndex((f, i) => !used.has(i)
+      && (f.key === title || f.key.endsWith(title) || f.key.startsWith(title))
+      && !(want && f.len && Math.abs(f.len - want) > 7));
+    if (i >= 0) { used.add(i); matched++; }
+  }
+  return matched;
+}
+
+function renderModalResults(results, area, isAlbum, artist, query, tracks = []) {
   area.innerHTML = '';
 
   if (!Array.isArray(results) || results.length === 0) {
@@ -1059,18 +1095,26 @@ function renderModalResults(results, area, isAlbum, artist) {
 
   // Show only 320k+ results when there are any; otherwise fall back to the
   // lower-bitrate ones, best first, and download those without the floor.
-  // A result with under half the tracks of the biggest one (e.g. one song in
-  // a compilation folder) doesn't count as a 320k+ copy of the album.
+  // With a tracklist, a result counts as the album when it has at least half
+  // its tracks, and full matches sort first (fewest extra files first, so a
+  // deluxe edition ranks below the plain album). Without one, a result with
+  // under half the tracks of the biggest one (e.g. one song in a compilation
+  // folder) doesn't count as a copy of the album.
+  const matches = new Map(results.map(r => [r, tracks.length ? countTrackMatches(r, tracks) : 0]));
+  const extra   = r => Math.abs(resultAudioFiles(r).length - tracks.length);
   const maxTracks = Math.max(...results.map(r => resultAudioFiles(r).length));
-  const complete  = r => resultAudioFiles(r).length * 2 >= maxTracks;
+  const complete  = tracks.length
+    ? r => matches.get(r) * 2 >= tracks.length
+    : r => resultAudioFiles(r).length * 2 >= maxTracks;
+  const byMatch = (a, b) => (matches.get(b) - matches.get(a)) || (extra(a) - extra(b));
   const good = results.filter(r => {
     const b = resultMinBitrate(r);
     return complete(r) && (b === null || b >= MIN_BITRATE);
-  });
+  }).sort(byMatch);
   const lowBitrate = good.length === 0;
   if (lowBitrate) {
     results = [...results].sort((a, b) =>
-      (complete(b) - complete(a)) || ((resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0)));
+      (complete(b) - complete(a)) || byMatch(a, b) || ((resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0)));
   } else {
     results = good;
   }
@@ -1103,7 +1147,10 @@ function renderModalResults(results, area, isAlbum, artist) {
     const userLine = document.createElement('div');
     userLine.className = 'preview-line-user';
     const minRate = resultMinBitrate(result);
-    userLine.textContent = lowBitrate && minRate ? `${username} · min ${minRate}k` : username;
+    const userParts = [username];
+    if (tracks.length) userParts.push(`${matches.get(result)}/${tracks.length} tracks`);
+    if (lowBitrate && minRate) userParts.push(`min ${minRate}k`);
+    userLine.textContent = userParts.join(' · ');
 
     const folderLine = document.createElement('div');
     folderLine.className = 'preview-line-folder';
@@ -1120,7 +1167,7 @@ function renderModalResults(results, area, isAlbum, artist) {
     dlBtn.onclick = () => {
       closeModal();
       const label = currentItem ? `${currentItem.artist} – ${currentItem.label}` : '';
-      download(slskLink, isAlbum, artist, lowBitrate, label);
+      download(slskLink, isAlbum, artist, lowBitrate, label, query, tracks);
     };
 
     cardTop.append(info, dlBtn);
@@ -1189,13 +1236,18 @@ const openLogs   = new Set();
 let jobsTimer = null;
 let lastJobs  = [];
 
-async function download(query, album, subfolder, lowBitrate = false, label = '') {
+// fallbackQuery and tracks let the server look for another source when the
+// picked one fails; for an album it only takes one with every track at 320k+.
+async function download(query, album, subfolder, lowBitrate = false, label = '', fallbackQuery = '', tracks = []) {
   toggleDownloads(true);
   try {
     const r = await fetch('/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, album, subfolder, lowBitrate, label }),
+      body: JSON.stringify({
+        query, album, subfolder, lowBitrate, label, fallbackQuery,
+        tracks: tracks.map(t => ({ title: t.title, length: t.length || 0 })),
+      }),
     });
     if (!r.ok) throw new Error(await r.text());
   } catch (e) {

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 const (
@@ -250,35 +251,144 @@ func removeFailedParents(outDir string, failedAlbums []string, log func(string))
 	}
 }
 
-// parseSlskURL extracts a search query "Artist Album" from a slsk://USER/PATH URL.
-// Returns ("", false) if the URL isn't usable as a fallback.
-func parseSlskURL(q string) (string, bool) {
-	if !strings.HasPrefix(q, "slsk://") {
-		return "", false
+// extractJSONArray decodes the first JSON array in sldl's mixed output
+// (`--print json-all` prints log lines around it) into v.
+func extractJSONArray(output string, v any) bool {
+	for i, ch := range output {
+		if ch == '[' {
+			if err := json.Unmarshal([]byte(output[i:]), v); err == nil {
+				return true
+			}
+		}
 	}
-	u, err := url.Parse(q)
-	if err != nil {
-		return "", false
+	return false
+}
+
+// slskResult is one folder from sldl's `--print json-all` album output.
+type slskResult struct {
+	User struct {
+		Username          string
+		HasFreeUploadSlot bool
+		UploadSpeed       float64
 	}
-	var parts []string
-	for _, p := range strings.Split(u.Path, "/") {
-		if p == "" {
+	Files []struct {
+		Filename string
+		Length   int // seconds
+		Bitrate  int
+	}
+}
+
+var bracketedRe = regexp.MustCompile(`\([^)]*\)|\[[^\]]*\]`)
+
+// normTitle is the key a file name and a tracklist title are compared by:
+// bracketed extras ("(feat. X)", "[Remastered]") dropped, then letters and
+// digits only. Keep in sync with normTitle in static/index.html.
+func normTitle(s string) string {
+	s = bracketedRe.ReplaceAllString(strings.ToLower(s), "")
+	return strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return r
+		}
+		return -1
+	}, s)
+}
+
+// audioFiles returns the result's audio files' names (without folder or
+// extension) as title keys, with their lengths and bitrates.
+func (r slskResult) audioFiles() (keys []string, lengths, bitrates []int) {
+	for _, f := range r.Files {
+		name := f.Filename[strings.LastIndexAny(f.Filename, `\/`)+1:]
+		if !audioExt[strings.ToLower(filepath.Ext(name))] {
 			continue
 		}
-		low := strings.ToLower(p)
-		// drop generic library-root names so the search isn't poisoned by them
-		if low == "beets" || low == "music" || low == "shared" || low == "downloads" || low == "complete" {
+		key := strings.TrimLeft(normTitle(strings.TrimSuffix(name, filepath.Ext(name))), "0123456789")
+		keys = append(keys, key)
+		lengths = append(lengths, f.Length)
+		bitrates = append(bitrates, f.Bitrate)
+	}
+	return
+}
+
+// countTrackMatches counts the tracks that have a file in r: the file's key
+// is, starts with or ends with the title, and the lengths are within 7s when
+// both are known. Each file counts once. Keep in sync with countTrackMatches
+// in static/index.html.
+func countTrackMatches(r slskResult, tracks []ExpectedTrack) int {
+	keys, lengths, _ := r.audioFiles()
+	used := make([]bool, len(keys))
+	matched := 0
+	for _, t := range tracks {
+		title := normTitle(t.Title)
+		if title == "" {
 			continue
 		}
-		parts = append(parts, p)
+		want := (t.Length + 500) / 1000
+		for i, k := range keys {
+			if used[i] || !(k == title || strings.HasPrefix(k, title) || strings.HasSuffix(k, title)) {
+				continue
+			}
+			if want > 0 && lengths[i] > 0 && (lengths[i]-want > 7 || want-lengths[i] > 7) {
+				continue
+			}
+			used[i] = true
+			matched++
+			break
+		}
 	}
-	if len(parts) == 0 {
-		return "", false
+	return matched
+}
+
+// fallbackCandidates returns slsk:// URLs of the results that hold every
+// track of the tracklist with no audio file below the bitrate floor (unknown
+// bitrate passes, as in sldl), skipping skipUser. Free upload slots first,
+// then fewest extra files, then upload speed.
+func fallbackCandidates(results []slskResult, tracks []ExpectedTrack, skipUser string) []string {
+	floor, _ := strconv.Atoi(minBitrate)
+	type cand struct {
+		url   string
+		r     slskResult
+		extra int
 	}
-	if len(parts) >= 2 {
-		return parts[len(parts)-2] + " " + parts[len(parts)-1], true
+	var cands []cand
+	for _, r := range results {
+		if r.User.Username == skipUser || countTrackMatches(r, tracks) < len(tracks) {
+			continue
+		}
+		keys, _, bitrates := r.audioFiles()
+		lowRate := false
+		for _, b := range bitrates {
+			if b > 0 && b < floor {
+				lowRate = true
+			}
+		}
+		if lowRate {
+			continue
+		}
+		var dir string
+		for _, f := range r.Files {
+			if audioExt[strings.ToLower(filepath.Ext(f.Filename))] {
+				dir = strings.TrimLeft(strings.ReplaceAll(f.Filename, `\`, "/"), "/")
+				dir = dir[:max(strings.LastIndex(dir, "/"), 0)]
+				break
+			}
+		}
+		cands = append(cands, cand{"slsk://" + r.User.Username + "/" + dir, r, len(keys) - len(tracks)})
 	}
-	return parts[0], true
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.r.User.HasFreeUploadSlot != b.r.User.HasFreeUploadSlot {
+			return a.r.User.HasFreeUploadSlot
+		}
+		if a.extra != b.extra {
+			return a.extra < b.extra
+		}
+		return a.r.User.UploadSpeed > b.r.User.UploadSpeed
+	})
+	urls := make([]string, len(cands))
+	for i, c := range cands {
+		urls[i] = c.url
+	}
+	return urls
 }
 
 func main() {
@@ -638,6 +748,16 @@ type DownloadRequest struct {
 	LowBitrate bool `json:"lowBitrate"`
 	// Label is the human name ("Artist – Album") shown in the downloads panel.
 	Label string `json:"label"`
+	// FallbackQuery ("Artist - Album") is searched when a slsk:// source
+	// fails. For an album, Tracks is the MusicBrainz tracklist a replacement
+	// must fully contain; without it no other source is tried.
+	FallbackQuery string          `json:"fallbackQuery"`
+	Tracks        []ExpectedTrack `json:"tracks"`
+}
+
+type ExpectedTrack struct {
+	Title  string `json:"title"`
+	Length int    `json:"length"` // ms, 0 if unknown
 }
 
 // downloadMu serializes whole download pipelines (sldl, fallback retry, beets).
@@ -708,15 +828,7 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 
 		fullOutput := strings.Join(allLines, "\n")
 		var results []json.RawMessage
-		jsonFound := false
-		for i, ch := range fullOutput {
-			if ch == '[' {
-				if err := json.Unmarshal([]byte(fullOutput[i:]), &results); err == nil {
-					jsonFound = true
-					break
-				}
-			}
-		}
+		jsonFound := extractJSONArray(fullOutput, &results)
 
 		// sldl prints nothing at all when a search comes back empty, so blank
 		// output with a clean exit is a genuine "nobody shares this".
@@ -848,34 +960,31 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 
 	saved := findSavedAlbums(outDir, startTime)
 
-	// If the direct sldl run produced no usable album (most often because a
-	// slsk:// URL pinned us to one offline / slot-starved user), fall back to
-	// a name-based search so sldl can pick any seeder.
-	if len(saved) == 0 {
-		if fallbackQuery, ok := parseSlskURL(req.Query); ok {
-			failed := findFailedAlbums(outDir, startTime)
-			removeFailedParents(outDir, failed, job.addLog)
-
-			job.update(func(j *Job) {
-				j.Tracks = nil
-				j.Phase = "That source failed, searching for others"
-				j.Notes = append(j.Notes, fmt.Sprintf("Source %s failed; retried as a search for %q", j.Source, fallbackQuery))
-			})
-			job.addLog(fmt.Sprintf("[fallback] direct URL failed; retrying with search %q", fallbackQuery))
-
-			retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, bitrate, req.Album, "--no-progress")
-			retrySig, retryStart, retryErr := runSldlAndStream(onLine, onStart, retryArgs, outDir)
-			if job.isCancelled() {
-				finishCancelled(job, outDir, startTime)
-				return
-			}
-			sigLines = append(sigLines, retrySig...)
-			saved = findSavedAlbums(outDir, retryStart)
-			if len(saved) == 0 && retryErr != nil {
-				exitErr = retryErr
-			} else if len(saved) > 0 {
-				exitErr = nil
-			}
+	// If a slsk:// source produced no usable album (most often an offline or
+	// slot-starved user), look for another copy. An album is only taken from a
+	// folder holding the full tracklist at the bitrate floor, so a failed source
+	// is never replaced by some other release.
+	if len(saved) == 0 && strings.HasPrefix(req.Query, "slsk://") {
+		removeFailedParents(outDir, findFailedAlbums(outDir, startTime), job.addLog)
+		var fbSaved []string
+		var fbSig []string
+		var fbErr error
+		var cancelled bool
+		if req.Album {
+			fbSaved, fbSig, fbErr, cancelled = fallbackAlbum(job, req, username, password, outDir, onLine, onStart)
+		} else {
+			fbSaved, fbSig, fbErr, cancelled = fallbackTrack(job, req, username, password, outDir, onLine, onStart)
+		}
+		if cancelled {
+			finishCancelled(job, outDir, startTime)
+			return
+		}
+		sigLines = append(sigLines, fbSig...)
+		saved = fbSaved
+		if len(saved) > 0 {
+			exitErr = nil
+		} else if fbErr != nil {
+			exitErr = fbErr
 		}
 	}
 
@@ -910,6 +1019,95 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 			j.Tag = &JobTag{Status: "error"}
 		}
 	})
+}
+
+// fallbackAlbum searches req.FallbackQuery for folders holding the whole
+// req.Tracks at the bitrate floor and downloads the best one, trying the next
+// when a source fails. Without a tracklist nothing is tried.
+func fallbackAlbum(job *Job, req DownloadRequest, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error, cancelled bool) {
+	const maxTries = 3
+	if req.FallbackQuery == "" || len(req.Tracks) == 0 {
+		job.update(func(j *Job) {
+			j.Notes = append(j.Notes, "Source failed; no tracklist to check other sources against, so none were tried")
+		})
+		return
+	}
+	failedUser := ""
+	if u, err := url.Parse(req.Query); err == nil {
+		failedUser = u.Host
+	}
+	job.update(func(j *Job) {
+		j.Tracks = nil
+		j.Error = ""
+		j.Phase = "That source failed, looking for another full copy"
+	})
+	job.addLog(fmt.Sprintf("[fallback] direct URL failed; searching %q for all %d tracks at %sk+", req.FallbackQuery, len(req.Tracks), minBitrate))
+
+	// The search's JSON is collected, not parsed as download progress.
+	var out []string
+	searchArgs := buildSldlArgs(username, password, "", req.FallbackQuery, "", true, "--print", "json-all")
+	sig, _, err := runSldlAndStream(func(l string) { out = append(out, l) }, onStart, searchArgs, outDir)
+	if job.isCancelled() {
+		return nil, nil, nil, true
+	}
+	var results []slskResult
+	if !extractJSONArray(strings.Join(out, "\n"), &results) && err != nil {
+		return nil, sig, err, false
+	}
+	cands := fallbackCandidates(results, req.Tracks, failedUser)
+	job.addLog(fmt.Sprintf("[fallback] %d result(s), %d with the full tracklist at %sk+", len(results), len(cands), minBitrate))
+	if len(cands) == 0 {
+		job.update(func(j *Job) {
+			j.Error = "No other source has the full album at " + minBitrate + "k+"
+			j.Notes = append(j.Notes, fmt.Sprintf("Source %s failed; no other copy of all %d tracks at %sk+ found", failedUser, len(req.Tracks), minBitrate))
+		})
+		return nil, sig, nil, false
+	}
+
+	for i, cand := range cands[:min(len(cands), maxTries)] {
+		user := strings.TrimPrefix(cand, "slsk://")
+		user = user[:strings.Index(user, "/")]
+		job.update(func(j *Job) {
+			j.Tracks = nil
+			j.Error = ""
+			j.Source = user
+			j.Phase = "Trying another source"
+			j.Notes = append(j.Notes, fmt.Sprintf("Trying %s (full tracklist, %d of %d)", user, i+1, min(len(cands), maxTries)))
+		})
+		job.addLog(fmt.Sprintf("[fallback] trying %s", cand))
+		args := buildSldlArgs(username, password, outDir, cand, minBitrate, true, "--no-progress")
+		sig, start, err := runSldlAndStream(onLine, onStart, args, outDir)
+		if job.isCancelled() {
+			return nil, nil, nil, true
+		}
+		sigLines = append(sigLines, sig...)
+		if saved = findSavedAlbums(outDir, start); len(saved) > 0 {
+			return saved, sigLines, nil, false
+		}
+		exitErr = err
+		removeFailedParents(outDir, findFailedAlbums(outDir, start), job.addLog)
+	}
+	return nil, sigLines, exitErr, false
+}
+
+// fallbackTrack retries a single song as a name search for req.FallbackQuery,
+// always at the bitrate floor; sldl matches the title itself.
+func fallbackTrack(job *Job, req DownloadRequest, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error, cancelled bool) {
+	if req.FallbackQuery == "" {
+		return
+	}
+	job.update(func(j *Job) {
+		j.Tracks = nil
+		j.Phase = "That source failed, searching for others"
+		j.Notes = append(j.Notes, fmt.Sprintf("Source %s failed; retried as a search for %q", j.Source, req.FallbackQuery))
+	})
+	job.addLog(fmt.Sprintf("[fallback] direct URL failed; retrying with search %q", req.FallbackQuery))
+	args := buildSldlArgs(username, password, outDir, req.FallbackQuery, minBitrate, false, "--no-progress")
+	sigLines, start, exitErr := runSldlAndStream(onLine, onStart, args, outDir)
+	if job.isCancelled() {
+		return nil, nil, nil, true
+	}
+	return findSavedAlbums(outDir, start), sigLines, exitErr, false
 }
 
 // --- Download jobs ---
