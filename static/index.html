@@ -254,7 +254,7 @@ button.search-btn:hover { background: var(--a2); }
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
   gap: 0.8rem;
-  align-items: start;
+  align-items: stretch;
 }
 
 .empty {
@@ -342,6 +342,10 @@ button.search-btn:hover { background: var(--a2); }
   font-weight: 400;
   color: var(--t1);
   line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .result-meta {
   font-size: 0.74rem;
