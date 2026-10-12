@@ -148,94 +148,101 @@ button.search-btn {
 }
 button.search-btn:hover { background: var(--a2); }
 
-/* ── DOWNLOAD PANELS ── */
-#panels {
+/* ── DOWNLOADS DRAWER ── */
+.header-right { display: flex; align-items: center; gap: 0.5rem; }
+.dl-toggle { display: inline-flex; align-items: center; gap: 0.4rem; }
+.dl-toggle.has-active { border-color: var(--a); color: var(--a2); }
+.dl-count {
+  min-width: 1.1rem; padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--a); color: var(--bg);
+  font-size: 0.64rem; font-weight: 600; line-height: 1.1rem; text-align: center;
+}
+
+#downloads {
   position: fixed;
   bottom: 1rem;
   right: 1rem;
   z-index: 150;
-  width: 400px;
-  max-height: 60vh;
+  width: 420px;
+  max-height: 72vh;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  overflow-y: auto;
-  overflow-x: hidden;
-  pointer-events: none;
-}
-
-.panel {
   background: var(--s1);
   border: 1px solid var(--b2);
-  border-radius: 8px;
-  overflow: hidden;
-  pointer-events: auto;
+  border-radius: 10px;
   box-shadow: 0 8px 32px rgba(0,0,0,0.6), 0 2px 8px rgba(0,0,0,0.4);
+  overflow: hidden;
 }
-.panel-header {
-  padding: 0.5rem 0.9rem;
+.dl-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+  padding: 0.6rem 0.9rem;
   background: var(--s2);
   border-bottom: 1px solid var(--b1);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.75rem;
 }
-.panel-query {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--fm);
-  font-size: 0.71rem;
-  color: var(--t2);
-  min-width: 0;
+.dl-head-title {
+  font-size: 0.7rem; font-weight: 600; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--t2);
 }
-.panel-header-right {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  flex-shrink: 0;
+.dl-head-actions { display: flex; align-items: center; gap: 0.4rem; }
+.dl-link {
+  background: none; border: none; cursor: pointer;
+  color: var(--t3); font-family: var(--fu); font-size: 0.72rem;
+  padding: 0.15rem 0.3rem;
 }
-.status {
-  font-size: 0.68rem;
-  font-weight: 600;
-  color: var(--warn);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+.dl-link:hover { color: var(--t2); }
+.dl-x { font-size: 1.05rem; line-height: 1; }
+.dl-list { overflow-y: auto; }
+.dl-list::-webkit-scrollbar { width: 3px; }
+.dl-list::-webkit-scrollbar-thumb { background: var(--b2); border-radius: 2px; }
+.dl-empty { padding: 1.2rem 0.9rem; color: var(--t3); font-size: 0.8rem; }
+
+.job { padding: 0.75rem 0.9rem 0.7rem; border-bottom: 1px solid var(--b1); }
+.job:last-child { border-bottom: none; }
+.job-top { display: flex; align-items: baseline; justify-content: space-between; gap: 0.6rem; }
+.job-title {
+  font-size: 0.86rem; font-weight: 500; color: var(--t1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
 }
-.status.done  { color: var(--ok); }
-.status.error { color: var(--err); }
-.panel-close {
-  background: none; border: none;
+.job-top-right { display: flex; align-items: center; gap: 0.45rem; flex-shrink: 0; }
+.job-badge {
+  font-size: 0.62rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
   color: var(--t3);
-  font-size: 1.1rem;
-  line-height: 1;
-  cursor: pointer;
-  padding: 0;
-  display: flex;
-  align-items: center;
-  transition: color 0.15s;
 }
-.panel-close:hover { color: var(--t2); }
-
-.terminal {
-  padding: 0.7rem 1rem;
-  font-family: var(--fm);
-  font-size: 0.73rem;
-  color: var(--t2);
-  max-height: 12rem;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  line-height: 1.6;
+.job-badge.active { color: var(--a2); }
+.job-badge.done   { color: var(--ok); }
+.job-badge.warn   { color: var(--warn); }
+.job-badge.failed { color: var(--err); }
+.job-sub { margin-top: 0.15rem; font-size: 0.72rem; color: var(--t3); }
+.job-bar {
+  margin-top: 0.55rem; height: 3px; border-radius: 2px;
+  background: var(--s3); overflow: hidden; display: flex;
 }
-.terminal::-webkit-scrollbar { width: 3px; }
-.terminal::-webkit-scrollbar-thumb { background: var(--b2); border-radius: 2px; }
-
-.line-error { color: var(--err); }
-.line-warn  { color: var(--warn); }
-.line-ok    { color: var(--ok); }
-.line-beets { color: var(--pu); }
+.job-bar span { display: block; height: 100%; }
+.job-bar .ok   { background: var(--a); }
+.job-bar .fail { background: var(--err); }
+.job-line { margin-top: 0.45rem; font-size: 0.76rem; color: var(--t2); line-height: 1.45; }
+.job-line.ok   { color: var(--ok); }
+.job-line.warn { color: var(--warn); }
+.job-line.err  { color: var(--err); }
+.job-line a { color: inherit; }
+.job-path { margin-top: 0.2rem; font-family: var(--fm); font-size: 0.66rem; color: var(--t3); word-break: break-all; }
+.job-actions { margin-top: 0.4rem; display: flex; gap: 0.2rem; margin-left: -0.3rem; }
+.job-tracks { margin-top: 0.3rem; font-size: 0.74rem; }
+.job-track { display: flex; gap: 0.5rem; padding: 0.12rem 0; color: var(--t2); }
+.job-track .ic { width: 1rem; text-align: center; flex-shrink: 0; color: var(--t3); }
+.job-track.done .ic        { color: var(--ok); }
+.job-track.downloading .ic { color: var(--a2); }
+.job-track.failed          { color: var(--err); }
+.job-track.failed .ic      { color: var(--err); }
+.job-track .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-log {
+  margin-top: 0.35rem; padding: 0.5rem 0.6rem;
+  max-height: 14rem; overflow: auto;
+  background: var(--bg); border: 1px solid var(--b1); border-radius: 5px;
+  font-family: var(--fm); font-size: 0.66rem; color: var(--t3);
+  white-space: pre-wrap; word-break: break-all; line-height: 1.55;
+}
 
 /* ── RESULTS SECTION ── */
 .results-section {
@@ -594,7 +601,7 @@ button.search-btn:hover { background: var(--a2); }
   .result-meta { font-size: 0.64rem; }
   .result-meta2, .tag { display: none; }
 
-  #panels { width: calc(100% - 2rem); right: 1rem; left: 1rem; }
+  #downloads { width: auto; right: 0.75rem; left: 0.75rem; bottom: 0.75rem; }
   .modal-tracks-col { display: none; }
 }
 </style>
@@ -603,7 +610,10 @@ button.search-btn:hover { background: var(--a2); }
 
 <header class="header">
   <div class="header-wordmark">sl<b>dl</b></div>
-  <button class="clear-btn" onclick="clearAll()">clear all</button>
+  <div class="header-right">
+    <button class="clear-btn dl-toggle" id="dl-toggle" onclick="toggleDownloads()">downloads<span class="dl-count" id="dl-count" hidden></span></button>
+    <button class="clear-btn" onclick="clearAll()">clear all</button>
+  </div>
 </header>
 
 <div class="search-section">
@@ -622,7 +632,16 @@ button.search-btn:hover { background: var(--a2); }
   </div>
 </div>
 
-<div id="panels"></div>
+<aside id="downloads" hidden>
+  <div class="dl-head">
+    <span class="dl-head-title">Downloads</span>
+    <div class="dl-head-actions">
+      <button class="dl-link" onclick="dismissJob('finished')">clear finished</button>
+      <button class="dl-link dl-x" onclick="toggleDownloads(false)" title="Close">×</button>
+    </div>
+  </div>
+  <div class="dl-list" id="dl-list"></div>
+</aside>
 
 <div class="results-section">
   <div id="results"></div>
@@ -840,7 +859,10 @@ document.getElementById('modal-overlay').addEventListener('click', e => {
 document.getElementById('modal-close-btn').addEventListener('click', closeModal);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
+let currentItem = null;
+
 function openModal(item) {
+  currentItem = item;
   if (currentAbortController) currentAbortController.abort();
   currentAbortController = new AbortController();
 
@@ -1091,7 +1113,8 @@ function renderModalResults(results, area, isAlbum, artist) {
     dlBtn.style.flexShrink = '0';
     dlBtn.onclick = () => {
       closeModal();
-      download(slskLink, isAlbum, artist, lowBitrate);
+      const label = currentItem ? `${currentItem.artist} – ${currentItem.label}` : '';
+      download(slskLink, isAlbum, artist, lowBitrate, label);
     };
 
     cardTop.append(info, dlBtn);
@@ -1146,107 +1169,202 @@ function esc(s) {
 }
 
 function clearAll() {
-  document.getElementById('panels').innerHTML = '';
   document.getElementById('results').innerHTML = '';
   document.getElementById('q-artist').value = '';
   document.getElementById('q-title').value = '';
 }
 
-function closePanel(id) {
-  document.getElementById(id)?.remove();
-}
+// ── Downloads ──
+// Downloads run on the server; this panel just polls /jobs, so it survives
+// reloads and closed tabs.
 
-async function download(query, album, subfolder, lowBitrate = false) {
-  const id    = Date.now();
-  const panel = document.createElement('div');
-  panel.className = 'panel';
-  panel.id = `panel-${id}`;
-  panel.innerHTML = `
-    <div class="panel-header">
-      <span class="panel-query">${esc(query)}</span>
-      <div class="panel-header-right">
-        <span class="status" id="status-${id}">running</span>
-        <button class="panel-close" onclick="closePanel('panel-${id}')" title="Close">×</button>
-      </div>
-    </div>
-    <div class="terminal" id="term-${id}"></div>
-  `;
-  document.getElementById('panels').prepend(panel);
+const openTracks = new Set();
+const openLogs   = new Set();
+let jobsTimer = null;
+let lastJobs  = [];
 
-  const term   = document.getElementById(`term-${id}`);
-  const status = document.getElementById(`status-${id}`);
-
+async function download(query, album, subfolder, lowBitrate = false, label = '') {
+  toggleDownloads(true);
   try {
     const r = await fetch('/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, album, subfolder, lowBitrate }),
+      body: JSON.stringify({ query, album, subfolder, lowBitrate, label }),
     });
-
-    const reader  = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const text = line.slice(6);
-
-        if (text === '[done]') {
-          status.textContent = 'done';
-          status.className   = 'status done';
-        } else if (text.startsWith('[saved] ')) {
-          const s = document.createElement('span');
-          s.className = 'line-ok';
-          s.textContent = 'Saved: ' + text.slice(8) + '\n';
-          term.appendChild(s);
-        } else if (text.startsWith('[beets] ')) {
-          const s = document.createElement('span');
-          s.className = 'line-beets';
-          s.textContent = text + '\n';
-          term.appendChild(s);
-        } else if (text.startsWith('[queued] ')) {
-          status.textContent = 'queued';
-          status.className   = 'status';
-          const s = document.createElement('span');
-          s.textContent = text.slice(9) + '\n';
-          term.appendChild(s);
-        } else if (text.startsWith('[error-detail] ')) {
-          const s = document.createElement('span');
-          s.className = 'line-error';
-          s.textContent = '  ' + text.slice(15) + '\n';
-          term.appendChild(s);
-        } else if (text.startsWith('[error]')) {
-          status.textContent = 'error';
-          status.className   = 'status error';
-          const s = document.createElement('span');
-          s.className = 'line-error';
-          s.textContent = text + '\n';
-          term.appendChild(s);
-        } else {
-          const s  = document.createElement('span');
-          const lo = text.toLowerCase();
-          if (/fail|error|not found|no result|unable|timeout/.test(lo)) s.className = 'line-error';
-          else if (/warn|skip/.test(lo)) s.className = 'line-warn';
-          else if (/done|saved|success|complete/.test(lo)) s.className = 'line-ok';
-          s.textContent = text + '\n';
-          term.appendChild(s);
-        }
-        term.scrollTop = term.scrollHeight;
-      }
-    }
+    if (!r.ok) throw new Error(await r.text());
   } catch (e) {
-    status.textContent = 'disconnected';
-    status.className   = 'status';
-    term.textContent  += `\nConnection lost (${e.message}). The download keeps running on the server.\n`;
+    alertInPanel(`Could not start download: ${e.message}`);
   }
+  refreshJobs();
 }
+
+function toggleDownloads(open) {
+  const el = document.getElementById('downloads');
+  el.hidden = open === undefined ? !el.hidden : !open;
+  if (!el.hidden) refreshJobs();
+}
+
+function alertInPanel(msg) {
+  const list = document.getElementById('dl-list');
+  const d = document.createElement('div');
+  d.className = 'dl-empty';
+  d.style.color = 'var(--err)';
+  d.textContent = msg;
+  list.prepend(d);
+}
+
+async function dismissJob(id) {
+  await fetch(`/jobs/dismiss?id=${encodeURIComponent(id)}`, { method: 'POST' });
+  openTracks.delete(id); openLogs.delete(id);
+  refreshJobs();
+}
+
+async function refreshJobs() {
+  clearTimeout(jobsTimer);
+  try {
+    const r = await fetch('/jobs');
+    lastJobs = (await r.json()).jobs || [];
+  } catch { /* keep the last known state; try again below */ }
+
+  const active = lastJobs.filter(isActive).length;
+  const count  = document.getElementById('dl-count');
+  count.hidden = active === 0;
+  count.textContent = active;
+  document.getElementById('dl-toggle').classList.toggle('has-active', active > 0);
+
+  const panel = document.getElementById('downloads');
+  if (!panel.hidden) await renderJobs();
+
+  // Poll fast while something runs, slowly while the panel is open, else stop.
+  if (active) jobsTimer = setTimeout(refreshJobs, 1500);
+  else if (!panel.hidden) jobsTimer = setTimeout(refreshJobs, 10000);
+}
+
+const isActive = j => ['queued', 'downloading', 'tagging'].includes(j.status);
+
+async function renderJobs() {
+  const list = document.getElementById('dl-list');
+  if (!lastJobs.length) {
+    list.innerHTML = '<div class="dl-empty">No downloads yet. Pick a result and press Download.</div>';
+    return;
+  }
+  const logs = {};
+  await Promise.all(lastJobs.filter(j => openLogs.has(j.id)).map(async j => {
+    try { logs[j.id] = await (await fetch(`/jobs/log?id=${j.id}`)).text(); } catch {}
+  }));
+
+  // Keep each open log scrolled where the user left it (or pinned to bottom).
+  const scroll = {};
+  list.querySelectorAll('.job-log').forEach(el => {
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+    scroll[el.dataset.id] = atBottom ? 'bottom' : el.scrollTop;
+  });
+
+  list.innerHTML = lastJobs.map(j => jobHTML(j, logs[j.id])).join('');
+
+  list.querySelectorAll('.job-log').forEach(el => {
+    const s = scroll[el.dataset.id];
+    el.scrollTop = s === undefined || s === 'bottom' ? el.scrollHeight : s;
+  });
+}
+
+function toggleSet(set, id) {
+  set.has(id) ? set.delete(id) : set.add(id);
+  renderJobs();
+}
+
+const BADGE = {
+  queued:      ['queued', 'active'],
+  downloading: ['downloading', 'active'],
+  tagging:     ['tagging', 'active'],
+  done:        ['done', 'done'],
+  failed:      ['failed', 'failed'],
+  interrupted: ['interrupted', 'failed'],
+};
+
+function jobHTML(j, log) {
+  const tracks = j.tracks || [];
+  const done   = tracks.filter(t => t.state === 'done').length;
+  const failed = tracks.filter(t => t.state === 'failed').length;
+  let [badge, badgeCls] = BADGE[j.status] || [j.status, ''];
+  if (j.status === 'done' && j.tag && j.tag.status !== 'matched') badgeCls = 'warn';
+
+  const sub = [j.source ? `from ${esc(j.source)}` : '', timeAgo(j.created)].filter(Boolean).join(' · ');
+  const out = [`<div class="job">
+    <div class="job-top">
+      <span class="job-title" title="${esc(j.query)}">${esc(j.label)}</span>
+      <span class="job-top-right">
+        <span class="job-badge ${badgeCls}">${badge}</span>
+        ${isActive(j) ? '' : `<button class="dl-link dl-x" onclick="dismissJob('${j.id}')" title="Remove">×</button>`}
+      </span>
+    </div>
+    <div class="job-sub">${sub}</div>`];
+
+  if (tracks.length) {
+    const pct = n => (100 * n / tracks.length).toFixed(1);
+    out.push(`<div class="job-bar"><span class="ok" style="width:${pct(done)}%"></span><span class="fail" style="width:${pct(failed)}%"></span></div>`);
+  }
+
+  // One plain-language line for "what is happening / what happened".
+  if (isActive(j)) {
+    let line = j.phase || '';
+    const now = tracks.filter(t => t.state === 'downloading').map(t => t.name);
+    if (j.status === 'downloading' && tracks.length) {
+      line = `${done} of ${tracks.length} tracks` + (failed ? `, ${failed} failed` : '');
+      if (now.length) line += ` · now: ${esc(now[0])}${now.length > 1 ? ` +${now.length - 1}` : ''}`;
+      else if (tracks.some(t => t.state === 'waiting')) line += ' · waiting for the uploader';
+      out.push(`<div class="job-line">${line}</div>`);
+    } else {
+      out.push(`<div class="job-line">${esc(line)}…</div>`);
+    }
+  } else if (j.status === 'done') {
+    const t = j.tag;
+    if (!j.saved) {
+      out.push(`<div class="job-line warn">${esc(j.phase || 'Nothing new was downloaded')}</div>`);
+    } else if (t && t.status === 'matched') {
+      const rel = t.url ? `<a href="${esc(t.url)}" target="_blank" rel="noopener">${esc(t.release)}</a>` : esc(t.release);
+      const fixes = t.changes ? ` · ${t.changes} tag fix${t.changes === 1 ? '' : 'es'}` : '';
+      out.push(`<div class="job-line ok">Saved and tagged as ${rel} (${esc(t.similarity)} match${fixes})</div>`);
+    } else if (t && t.status === 'skipped') {
+      out.push(`<div class="job-line warn">Saved, but not tagged: ${esc(t.reason || 'no confident match')}</div>`);
+    } else {
+      out.push(`<div class="job-line warn">Saved, but tagging failed. See the log.</div>`);
+    }
+    if (j.saved) out.push(`<div class="job-path">${esc(j.saved)}</div>`);
+  } else {
+    out.push(`<div class="job-line err">${esc(j.error || 'Failed')}</div>`);
+    if (tracks.length) out.push(`<div class="job-sub">${done} of ${tracks.length} tracks had finished</div>`);
+  }
+  (j.notes || []).forEach(n => out.push(`<div class="job-sub">${esc(n)}</div>`));
+
+  const acts = [];
+  if (tracks.length) acts.push(`<button class="dl-link" onclick="toggleSet(openTracks,'${j.id}')">${openTracks.has(j.id) ? 'hide' : 'show'} tracks</button>`);
+  acts.push(`<button class="dl-link" onclick="toggleSet(openLogs,'${j.id}')">${openLogs.has(j.id) ? 'hide' : 'show'} full log</button>`);
+  out.push(`<div class="job-actions">${acts.join('')}</div>`);
+
+  if (openTracks.has(j.id)) {
+    const icon = { done: '✓', downloading: '↓', failed: '✗', waiting: '·' };
+    out.push('<div class="job-tracks">' + tracks.map(t =>
+      `<div class="job-track ${t.state}"><span class="ic">${icon[t.state] || '·'}</span><span class="nm">${esc(t.name)}</span></div>`
+    ).join('') + '</div>');
+  }
+  if (openLogs.has(j.id)) {
+    const extra = (j.details || []).length ? (j.details.join('\n') + '\n\n') : '';
+    out.push(`<pre class="job-log" data-id="${j.id}">${esc(extra + (log ?? 'Loading…'))}</pre>`);
+  }
+  out.push('</div>');
+  return out.join('');
+}
+
+function timeAgo(iso) {
+  const s = Math.max(0, (Date.now() - new Date(iso)) / 1000);
+  if (s < 60)    return 'just now';
+  if (s < 3600)  return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+refreshJobs();
 </script>
 </body>
 </html>

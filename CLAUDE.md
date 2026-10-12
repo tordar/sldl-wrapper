@@ -42,28 +42,31 @@ These are only available inside the container (not locally):
 | Music volume | `/music` | Download destination, path-traversal boundary |
 | Beets data | `/data` | `beets-library.db` and `beets-import.log` |
 
-Environment variables required: `SLDL_USER`, `SLDL_PASS`.
+Environment variables required: `SLDL_USER`, `SLDL_PASS`. Optional: `SLDL_PREVIEW_USER`, `SLDL_PREVIEW_PASS` (see Job queue). On the NAS all four live in `/volume1/docker/sldl-wrapper/.env`.
 
 ## Architecture
 
 Everything lives in `main.go`. Key concepts:
 
-**Job queue** — a buffered channel (`jobQueue`, cap 50) serializes all sldl invocations through a single `jobWorker` goroutine. Both `/preview` and `/download` enqueue jobs and wait until the job runs.
+**Job queue** — a Soulseek account can only be logged in once (a second login kicks the first), so sldl runs on one account must be serialized. `jobQueue` (cap 50, one `jobWorker`) runs downloads. If `SLDL_PREVIEW_USER`/`SLDL_PREVIEW_PASS` are set, previews get their own `previewQueue` + worker, log in as that account and pass `--listen-port 49997` (two sldl processes in one container can't both bind the default 49998). Without them, `previewQueue` is just `jobQueue` and previews wait behind downloads.
 
 **Download lock** — `downloadMu` additionally serializes whole download pipelines (sldl, fallback retry, beets). This is required because the saved album is found by file mtime: if download B's sldl started while A's beets was still writing tags, B's scan would pick up album A. `downloadsPending` counts downloads in or waiting for the pipeline (exposed in `/queue`). Previews don't take the lock.
 
-**SSE streaming** — all long-running endpoints (`/download`, `/preview`, `/retag`) go through `serveSSE`, which runs the work in its own goroutine and forwards whatever it `emit`s as `data:` lines. Each write has a 30s deadline. When the client disconnects (or a write times out), `emit` becomes a no-op and the work carries on, so a closed tab or a phone losing signal never stalls the queue.
+**Download jobs** — `POST /download` doesn't stream: it creates a `Job`, starts `runDownload` in a goroutine and returns `{"id"}`. `runDownload` parses sldl output (`Job.sldlLine`, run with `--no-progress`) into per-track states and beets output (`Job.beetsLine`) into a `JobTag` (matched/skipped + reason/error, release, similarity, URL). The UI's Downloads drawer polls `GET /jobs` (no raw logs), fetches `GET /jobs/log?id=` on demand and removes finished jobs via `POST /jobs/dismiss?id=` (`id=finished` for all). Jobs are persisted to `/data/jobs.json` on every status change; anything still active when the server restarts comes back as `interrupted`. The parsers depend on sldl 2.6's output strings (see `sldlTrackRe`, `sldlListedRe`); recheck them when upgrading sldl.
 
-**Downloads outlive the request** — `/download` runs sldl with `exec.Command` (not `CommandContext(r.Context())`), so the download, fallback retry and beets all finish even with no browser attached. Outcomes are also `log.Printf`'d to the container log. `/preview` is the exception: it is tied to the request context and dies with it.
+**SSE streaming** — `/preview` and `/retag` go through `serveSSE`, which runs the work in its own goroutine and forwards whatever it `emit`s as `data:` lines. Each write has a 30s deadline. When the client disconnects (or a write times out), `emit` becomes a no-op and the work carries on, so a closed tab or a phone losing signal never stalls the queue.
+
+**Downloads outlive the request** — downloads run with `exec.Command` in a background goroutine, so they finish with no browser attached. Outcomes are also `log.Printf`'d to the container log. `/preview` is tied to the request context and dies with it.
 
 **Endpoints**:
 - `GET /search?q=&type=` — proxies MusicBrainz `/recording/` search, or `/release-group/` when `type=album`
 - `GET /release?id=` — proxies MusicBrainz release detail (with recordings)
 - `GET /release-group?id=` — picks the earliest Official release in the group and returns its detail (with recordings)
 - `POST /preview` — runs sldl with `--print json-all` (no actual download); extracts the JSON block from mixed output and emits it as a `[results]` SSE event. sldl prints *nothing* when a search is empty, so blank output + exit 0 is sent as `[results] []`; a non-zero exit becomes `[preview-error]` lines. Every preview's outcome is `log.Printf`'d
-- `POST /download` — runs sldl to download, then calls beets on the newly-created album directory. If a `slsk://` URL yields nothing, it removes sldl's `failed/` residue and retries as a name search parsed from the URL path
+- `POST /download` — starts a download job (see Download jobs): sldl, then beets on the newly-created album directory. If a `slsk://` URL yields nothing, it removes sldl's `failed/` residue and retries as a name search parsed from the URL path
 - `GET /retag?path=` — strips promo tags (inline Python/mutagen script) then runs beets; path must be under `/music`
-- `GET /queue` — returns `{"queued": N}` (current depth of jobQueue)
+- `GET /queue` — returns `{"queued": N, "downloads": M}` (jobQueue depth, downloads running or waiting). Check `downloads` is 0 before redeploying: a restart kills running downloads
+- `GET /jobs`, `GET /jobs/log?id=`, `POST /jobs/dismiss?id=` — downloads drawer API
 
 **Path safety** — `/download` validates `subfolder` doesn't escape `/music`; `/retag` validates `path` prefix against `/music`. Both use `filepath.Clean`.
 

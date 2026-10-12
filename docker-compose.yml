@@ -12,4 +12,6 @@ services:
     environment:
       - SLDL_USER=${SLDL_USER}
       - SLDL_PASS=${SLDL_PASS}
+      - SLDL_PREVIEW_USER=${SLDL_PREVIEW_USER:-}
+      - SLDL_PREVIEW_PASS=${SLDL_PREVIEW_PASS:-}
     restart: unless-stopped

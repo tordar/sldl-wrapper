@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,14 +66,28 @@ type DownloadJob struct {
 	exitErr   chan error
 }
 
+// jobQueue runs downloads (and previews, unless a preview account is set) one
+// at a time: a Soulseek user can only be logged in once, so a second sldl on
+// the same account would kick the first off.
 var jobQueue = make(chan *DownloadJob, 50)
 
-func init() {
-	go jobWorker()
+// previewQueue is jobQueue unless SLDL_PREVIEW_USER is set, in which case
+// previews log in as that account and run alongside downloads.
+var previewQueue = jobQueue
+
+// previewListenPort keeps a concurrent preview sldl off the download's
+// default listen port (49998), which it couldn't bind.
+const previewListenPort = "49997"
+
+func previewCredentials() (user, pass string, separate bool) {
+	if u, p := os.Getenv("SLDL_PREVIEW_USER"), os.Getenv("SLDL_PREVIEW_PASS"); u != "" && p != "" {
+		return u, p, true
+	}
+	return os.Getenv("SLDL_USER"), os.Getenv("SLDL_PASS"), false
 }
 
-func jobWorker() {
-	for job := range jobQueue {
+func jobWorker(queue chan *DownloadJob) {
+	for job := range queue {
 		job.startTime = time.Now()
 
 		pr, pw, err := os.Pipe()
@@ -268,6 +284,17 @@ func main() {
 	http.HandleFunc("/preview", handlePreview)
 	http.HandleFunc("/queue", handleQueueStatus)
 	http.HandleFunc("/retag", handleRetag)
+	http.HandleFunc("/jobs", handleJobs)
+	http.HandleFunc("/jobs/log", handleJobLog)
+	http.HandleFunc("/jobs/dismiss", handleJobDismiss)
+
+	go jobWorker(jobQueue)
+	if _, _, separate := previewCredentials(); separate {
+		previewQueue = make(chan *DownloadJob, 50)
+		go jobWorker(previewQueue)
+		log.Printf("previews use their own Soulseek account")
+	}
+	loadJobs()
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -599,6 +626,8 @@ type DownloadRequest struct {
 	// LowBitrate drops the minBitrate floor, for when the user picked a
 	// below-320 result because nothing better was available.
 	LowBitrate bool `json:"lowBitrate"`
+	// Label is the human name ("Artist – Album") shown in the downloads panel.
+	Label string `json:"label"`
 }
 
 // downloadMu serializes whole download pipelines (sldl, fallback retry, beets).
@@ -626,14 +655,17 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username := os.Getenv("SLDL_USER")
-	password := os.Getenv("SLDL_PASS")
+	username, password, separate := previewCredentials()
 	if username == "" || password == "" {
 		http.Error(w, "SLDL_USER or SLDL_PASS not set", http.StatusInternalServerError)
 		return
 	}
 
-	args := buildSldlArgs(username, password, "", req.Query, "", req.Album, "--print", "json-all")
+	extra := []string{"--print", "json-all"}
+	if separate {
+		extra = append(extra, "--listen-port", previewListenPort)
+	}
+	args := buildSldlArgs(username, password, "", req.Query, "", req.Album, extra...)
 
 	// A preview is only useful to the client that asked, so it dies with the request.
 	job := &DownloadJob{
@@ -644,12 +676,15 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	serveSSE(w, r, func(emit emitFunc) {
-		queueLen := len(jobQueue)
-		if queueLen > 0 {
-			emit("[queued] %d job(s) ahead — waiting...", queueLen)
+		if separate {
+			if n := len(previewQueue); n > 0 {
+				emit("[queued] %d search(es) ahead, waiting…", n)
+			}
+		} else if len(jobQueue) > 0 || downloadsPending.Load() > 0 {
+			emit("[queued] Waiting for the current download to finish…")
 		}
 
-		jobQueue <- job
+		previewQueue <- job
 
 		var allLines, sigLines []string
 		for line := range job.output {
@@ -698,21 +733,16 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// runSldlAndStream pushes a sldl invocation through the worker queue, streams
-// its stdout/stderr through emit, and returns the collected significant error
-// lines plus the exit error. The process is deliberately not tied to the
+// runSldlAndStream pushes a sldl invocation through the download queue, passes
+// each output line to onLine, and returns the collected significant error
+// lines plus the exit error. The process is deliberately not tied to any
 // request context: a download must survive the browser tab closing.
-func runSldlAndStream(emit emitFunc, args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
+func runSldlAndStream(onLine func(string), args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
 	job := &DownloadJob{
 		cmd:     exec.Command(sldlBinary, args...),
 		outDir:  outDir,
 		output:  make(chan string, 200),
 		exitErr: make(chan error, 1),
-	}
-
-	queueLen := len(jobQueue)
-	if queueLen > 0 {
-		emit("[queued] %d download(s) ahead — waiting...", queueLen)
 	}
 
 	jobQueue <- job
@@ -721,7 +751,7 @@ func runSldlAndStream(emit emitFunc, args []string, outDir string) (sigLines []s
 		if isSignificant(line) {
 			sigLines = append(sigLines, line)
 		}
-		emit("%s", line)
+		onLine(line)
 	}
 	exitErr = <-job.exitErr
 	startTime = job.startTime
@@ -760,61 +790,462 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	job := newJob(req)
+	go runDownload(job, req, username, password, outDir)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"id": job.ID})
+}
+
+// runDownload is the whole download pipeline for one job: wait for the
+// download lock, run sldl (plus the name-search fallback), then tag with beets.
+// Progress goes into the job, which the UI polls via /jobs.
+func runDownload(job *Job, req DownloadRequest, username, password, outDir string) {
 	bitrate := minBitrate
 	if req.LowBitrate {
 		bitrate = ""
 	}
 
-	serveSSE(w, r, func(emit emitFunc) {
-		ahead := downloadsPending.Add(1) - 1
-		defer downloadsPending.Add(-1)
-		if ahead > 0 {
-			emit("[queued] %d download(s) ahead — waiting...", ahead)
-		}
-		downloadMu.Lock()
-		defer downloadMu.Unlock()
+	ahead := downloadsPending.Add(1) - 1
+	defer downloadsPending.Add(-1)
+	if ahead > 0 {
+		job.update(func(j *Job) { j.Phase = fmt.Sprintf("Waiting for %d download(s) ahead", ahead) })
+	}
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
 
-		args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album)
-		sigLines, startTime, exitErr := runSldlAndStream(emit, args, outDir)
+	job.setStatus("downloading", "Connecting to Soulseek")
+	onLine := func(line string) { job.sldlLine(line) }
 
-		saved := findSavedAlbums(outDir, startTime)
+	args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album, "--no-progress")
+	sigLines, startTime, exitErr := runSldlAndStream(onLine, args, outDir)
 
-		// If the direct sldl run produced no usable album (most often because a
-		// slsk:// URL pinned us to one offline / slot-starved user), fall back to
-		// a name-based search so sldl can pick any seeder.
-		if len(saved) == 0 {
-			if fallbackQuery, ok := parseSlskURL(req.Query); ok {
-				failed := findFailedAlbums(outDir, startTime)
-				removeFailedParents(outDir, failed, func(msg string) { emit("%s", msg) })
+	saved := findSavedAlbums(outDir, startTime)
 
-				emit("[fallback] direct URL failed; retrying with search %q", fallbackQuery)
+	// If the direct sldl run produced no usable album (most often because a
+	// slsk:// URL pinned us to one offline / slot-starved user), fall back to
+	// a name-based search so sldl can pick any seeder.
+	if len(saved) == 0 {
+		if fallbackQuery, ok := parseSlskURL(req.Query); ok {
+			failed := findFailedAlbums(outDir, startTime)
+			removeFailedParents(outDir, failed, job.addLog)
 
-				retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, bitrate, req.Album)
-				retrySig, retryStart, retryErr := runSldlAndStream(emit, retryArgs, outDir)
-				sigLines = append(sigLines, retrySig...)
-				saved = findSavedAlbums(outDir, retryStart)
-				if len(saved) == 0 && retryErr != nil {
-					exitErr = retryErr
-				} else if len(saved) > 0 {
-					exitErr = nil
-				}
+			job.update(func(j *Job) {
+				j.Tracks = nil
+				j.Phase = "That source failed, searching for others"
+				j.Notes = append(j.Notes, fmt.Sprintf("Source %s failed; retried as a search for %q", j.Source, fallbackQuery))
+			})
+			job.addLog(fmt.Sprintf("[fallback] direct URL failed; retrying with search %q", fallbackQuery))
+
+			retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, bitrate, req.Album, "--no-progress")
+			retrySig, retryStart, retryErr := runSldlAndStream(onLine, retryArgs, outDir)
+			sigLines = append(sigLines, retrySig...)
+			saved = findSavedAlbums(outDir, retryStart)
+			if len(saved) == 0 && retryErr != nil {
+				exitErr = retryErr
+			} else if len(saved) > 0 {
+				exitErr = nil
 			}
 		}
+	}
 
-		// Logged as well as emitted: the client may have closed the tab long ago.
-		if exitErr != nil && len(saved) == 0 {
-			log.Printf("download %q failed: %v", req.Query, exitErr)
-			emit("[error] sldl exited: %v", exitErr)
-			for _, l := range sigLines {
-				emit("[error-detail] %s", l)
+	// Logged as well as recorded: the client may have closed the tab long ago.
+	if exitErr != nil && len(saved) == 0 {
+		log.Printf("download %q failed: %v", req.Query, exitErr)
+		job.finish("failed", func(j *Job) {
+			if j.Error == "" {
+				j.Error = "Download failed"
+			}
+			j.Details = append(j.Details, fmt.Sprintf("sldl exited: %v", exitErr))
+			j.Details = append(j.Details, sigLines...)
+		})
+		return
+	}
+	if len(saved) == 0 {
+		job.finish("done", func(j *Job) { j.Phase = "Nothing new was downloaded" })
+		return
+	}
+
+	log.Printf("download %q saved to %s", req.Query, saved[0])
+	job.update(func(j *Job) {
+		j.Saved = saved[0]
+		j.Status = "tagging"
+		j.Phase = "Matching against MusicBrainz"
+	})
+	saveJobs()
+	runBeets(func(format string, a ...any) { job.beetsLine(fmt.Sprintf(format, a...)) }, saved[0])
+	job.finish("done", func(j *Job) {
+		if j.Tag == nil {
+			j.Tag = &JobTag{Status: "error"}
+		}
+	})
+}
+
+// --- Download jobs ---
+
+const (
+	jobsFile       = "/data/jobs.json"
+	maxJobs        = 50
+	maxJobLog      = 3000
+	maxSavedJobLog = 300
+)
+
+type JobTrack struct {
+	Name  string `json:"name"`
+	State string `json:"state"` // waiting, downloading, done, failed
+}
+
+type JobTag struct {
+	Status     string `json:"status"` // matched, skipped, error
+	Reason     string `json:"reason,omitempty"`
+	Release    string `json:"release,omitempty"`
+	Similarity string `json:"similarity,omitempty"`
+	URL        string `json:"url,omitempty"`
+	Changes    int    `json:"changes"`
+}
+
+// Job is one download as the downloads panel sees it. All fields are guarded
+// by jobsMu; sldl/beets output is parsed into Tracks/Tag as it arrives so the
+// UI never has to interpret raw logs.
+type Job struct {
+	ID       string     `json:"id"`
+	Label    string     `json:"label"`
+	Query    string     `json:"query"`
+	Source   string     `json:"source,omitempty"`
+	Status   string     `json:"status"` // queued, downloading, tagging, done, failed, interrupted
+	Phase    string     `json:"phase"`
+	Tracks   []JobTrack `json:"tracks"`
+	Saved    string     `json:"saved,omitempty"`
+	Tag      *JobTag    `json:"tag,omitempty"`
+	Error    string     `json:"error,omitempty"`
+	Details  []string   `json:"details,omitempty"`
+	Notes    []string   `json:"notes,omitempty"`
+	Created  time.Time  `json:"created"`
+	Finished *time.Time `json:"finished,omitempty"`
+	Log      []string   `json:"log,omitempty"`
+
+	beetsExpect string // which beets value the next output line carries
+}
+
+var (
+	jobsMu sync.Mutex
+	jobs   []*Job // newest first
+)
+
+func newJob(req DownloadRequest) *Job {
+	j := &Job{
+		ID:      strconv.FormatInt(time.Now().UnixNano(), 36),
+		Label:   req.Label,
+		Query:   req.Query,
+		Status:  "queued",
+		Phase:   "Queued",
+		Created: time.Now(),
+	}
+	if j.Label == "" {
+		j.Label = req.Query
+	}
+	if u, err := url.Parse(req.Query); err == nil && u.Scheme == "slsk" {
+		j.Source = u.Host
+	}
+	jobsMu.Lock()
+	jobs = append([]*Job{j}, jobs...)
+	trimJobsLocked()
+	jobsMu.Unlock()
+	saveJobs()
+	return j
+}
+
+func (j *Job) active() bool {
+	return j.Status == "queued" || j.Status == "downloading" || j.Status == "tagging"
+}
+
+func (j *Job) update(fn func(j *Job)) {
+	jobsMu.Lock()
+	fn(j)
+	jobsMu.Unlock()
+}
+
+func (j *Job) setStatus(status, phase string) {
+	j.update(func(j *Job) { j.Status, j.Phase = status, phase })
+	saveJobs()
+}
+
+func (j *Job) finish(status string, fn func(j *Job)) {
+	j.update(func(j *Job) {
+		now := time.Now()
+		j.Status, j.Finished = status, &now
+		fn(j)
+	})
+	saveJobs()
+}
+
+func (j *Job) addLog(line string) {
+	j.update(func(j *Job) { j.appendLogLocked(line) })
+}
+
+func (j *Job) appendLogLocked(line string) {
+	j.Log = append(j.Log, line)
+	if len(j.Log) > maxJobLog {
+		j.Log = j.Log[len(j.Log)-maxJobLog:]
+	}
+}
+
+func (j *Job) setTrackLocked(name, state string) {
+	for i := range j.Tracks {
+		if j.Tracks[i].Name == name {
+			// A finished track can't go back to waiting on a late status line.
+			if s := j.Tracks[i].State; s != "done" && s != "failed" || state == "done" {
+				j.Tracks[i].State = state
 			}
 			return
 		}
-		if len(saved) > 0 {
-			log.Printf("download %q saved to %s", req.Query, saved[0])
-			emit("[saved] %s", saved[0])
-			runBeets(emit, saved[0])
+	}
+	j.Tracks = append(j.Tracks, JobTrack{Name: name, State: state})
+}
+
+var (
+	ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	// "Succeeded:     user\..\01 Song.mp3 [196s/160kbps/3.8MB]", see sldl's
+	// DownloadWrapper; the state is a TransferStates name or "Queued (R)".
+	sldlTrackRe = regexp.MustCompile(`^([A-Za-z]+(?:, [A-Za-z]+)*|Queued \([RL]\))(?: \([\d.]+MB\))?:\s+(.*\\.+ \[[^\]]*\])$`)
+	sldlTotalRe = regexp.MustCompile(`^Downloading (\d+) tracks`)
+	// Album mode lists the chosen folder up front: "[01]    01 Tuesday.mp3 [-1s/3.8MB]".
+	sldlListedRe   = regexp.MustCompile(`^\[\d+\]\s+(.+) \[[^\]]*\]$`)
+	beetsSimilarRe = regexp.MustCompile(`\(Similarity: ([\d.]+%)\)`)
+)
+
+func sldlTrackState(state string) string {
+	switch {
+	case strings.Contains(state, "Succeeded"):
+		return "done"
+	case strings.Contains(state, "InProgress"):
+		return "downloading"
+	case strings.Contains(state, "TimedOut"), strings.Contains(state, "Errored"),
+		strings.Contains(state, "Rejected"), strings.Contains(state, "Cancelled"),
+		strings.Contains(state, "Aborted"):
+		return "failed"
+	}
+	return "waiting"
+}
+
+// sldlLine records one line of sldl output and folds it into the job state.
+func (j *Job) sldlLine(raw string) {
+	line := strings.TrimSpace(ansiRe.ReplaceAllString(raw, ""))
+	j.update(func(j *Job) {
+		j.appendLogLocked(line)
+		switch {
+		case strings.HasPrefix(line, "Login "):
+			j.Phase = "Logging in to Soulseek"
+		case strings.HasPrefix(line, "Searching:"), strings.HasPrefix(line, "Album download:"):
+			j.Phase = "Searching Soulseek"
+		case strings.HasPrefix(line, "Getting files in folder"):
+			j.Phase = "Reading the uploader's folder"
+		case strings.HasPrefix(line, "User  :"):
+			if strings.Contains(line, "no upload slots") {
+				j.Phase = "Uploader has no free slots, waiting in their queue"
+			}
+		case strings.HasPrefix(line, "Disconnected"):
+			j.Phase = "Reconnecting to Soulseek"
+		case sldlTotalRe.MatchString(line):
+			j.Phase = "Downloading"
+		case strings.HasPrefix(line, "Completed:"):
+			j.Phase = strings.TrimSuffix(line, ".")
+		case strings.HasPrefix(line, "Not found:"):
+			j.Error = "Not found on Soulseek"
+		case strings.HasPrefix(line, "All downloads failed:"):
+			j.Error = "Every source failed"
+		case strings.HasPrefix(line, "Moving album files to"), strings.HasPrefix(line, "Deleting album files"):
+			j.Error = "Album incomplete, partial files removed"
+		default:
+			if m := sldlListedRe.FindStringSubmatch(line); m != nil {
+				if name := m[1]; audioExt[strings.ToLower(filepath.Ext(name))] {
+					j.setTrackLocked(strings.TrimSuffix(name, filepath.Ext(name)), "waiting")
+				}
+				return
+			}
+			m := sldlTrackRe.FindStringSubmatch(line)
+			if m == nil {
+				return
+			}
+			name := m[2]
+			if i := strings.LastIndex(name, " ["); i > 0 {
+				name = name[:i]
+			}
+			if i := strings.LastIndexAny(name, `\/`); i >= 0 {
+				name = name[i+1:]
+			}
+			if !audioExt[strings.ToLower(filepath.Ext(name))] {
+				return
+			}
+			j.setTrackLocked(strings.TrimSuffix(name, filepath.Ext(name)), sldlTrackState(m[1]))
 		}
-		emit("[done]")
 	})
+}
+
+// beetsLine records one line of runBeets output and folds the match result
+// into job.Tag. Beets prints the value on the line after its label.
+func (j *Job) beetsLine(raw string) {
+	line := strings.TrimPrefix(ansiRe.ReplaceAllString(raw, ""), "[beets] ")
+	trimmed := strings.TrimSpace(line)
+	j.update(func(j *Job) {
+		j.appendLogLocked("[beets] " + line)
+		if j.Tag == nil {
+			j.Tag = &JobTag{}
+		}
+		switch expect := j.beetsExpect; {
+		case expect == "release" && trimmed != "":
+			j.Tag.Release, j.beetsExpect = trimmed, ""
+			return
+		case expect == "url" && trimmed != "":
+			j.Tag.URL, j.beetsExpect = trimmed, ""
+			return
+		case expect == "from":
+			j.beetsExpect = ""
+			return
+		}
+		switch {
+		case trimmed == "Tagging:", trimmed == "To:":
+			j.beetsExpect = "release"
+		case trimmed == "Correcting tags from:":
+			j.beetsExpect = "from"
+		case trimmed == "URL:":
+			j.beetsExpect = "url"
+		case strings.HasPrefix(trimmed, "This album is already in the library"):
+			j.Tag.Reason = "already in the beets library"
+		case trimmed == "Skipping.":
+			j.Tag.Status = "skipped"
+			if j.Tag.Reason == "" {
+				j.Tag.Reason = "no confident MusicBrainz match"
+			}
+		case strings.HasPrefix(trimmed, "* "):
+			j.Tag.Changes++
+		case strings.HasPrefix(trimmed, "Could not start beets"), strings.HasPrefix(trimmed, "finished with warning"):
+			if j.Tag.Status == "" {
+				j.Tag.Status = "error"
+			}
+		default:
+			if m := beetsSimilarRe.FindStringSubmatch(trimmed); m != nil {
+				j.Tag.Similarity, j.Tag.Status = m[1], "matched"
+			}
+		}
+		if j.Tag.Status == "" {
+			j.Tag.Status = "error" // overwritten once a match or skip line arrives
+		}
+	})
+}
+
+// trimJobsLocked drops the oldest finished jobs beyond maxJobs.
+func trimJobsLocked() {
+	for len(jobs) > maxJobs {
+		i := len(jobs) - 1
+		for i >= 0 && jobs[i].active() {
+			i--
+		}
+		if i < 0 {
+			return
+		}
+		jobs = append(jobs[:i], jobs[i+1:]...)
+	}
+}
+
+// saveJobs persists the job list (with a shortened log) so the panel survives
+// container restarts. Best effort: /data may not exist outside the container.
+func saveJobs() {
+	jobsMu.Lock()
+	out := make([]Job, len(jobs))
+	for i, j := range jobs {
+		out[i] = *j
+		if n := len(j.Log); n > maxSavedJobLog {
+			out[i].Log = j.Log[n-maxSavedJobLog:]
+		}
+	}
+	data, err := json.Marshal(out)
+	jobsMu.Unlock()
+	if err != nil {
+		return
+	}
+	tmp := jobsFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err == nil {
+		os.Rename(tmp, jobsFile)
+	}
+}
+
+// loadJobs restores saved jobs. Anything that was still running when the
+// server stopped is gone for good, so it is marked interrupted.
+func loadJobs() {
+	data, err := os.ReadFile(jobsFile)
+	if err != nil {
+		return
+	}
+	var saved []*Job
+	if err := json.Unmarshal(data, &saved); err != nil {
+		log.Printf("ignoring unreadable %s: %v", jobsFile, err)
+		return
+	}
+	for _, j := range saved {
+		if j.active() {
+			j.Status = "interrupted"
+			j.Error = "Interrupted by a server restart"
+		}
+	}
+	jobsMu.Lock()
+	jobs = saved
+	jobsMu.Unlock()
+}
+
+// handleJobs lists all jobs, newest first, without their raw logs.
+func handleJobs(w http.ResponseWriter, r *http.Request) {
+	jobsMu.Lock()
+	out := make([]Job, len(jobs))
+	for i, j := range jobs {
+		out[i] = *j
+		out[i].Log = nil
+	}
+	jobsMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(map[string]any{"jobs": out})
+}
+
+func handleJobLog(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	jobsMu.Lock()
+	var lines []string
+	found := false
+	for _, j := range jobs {
+		if j.ID == id {
+			lines, found = append([]string(nil), j.Log...), true
+			break
+		}
+	}
+	jobsMu.Unlock()
+	if !found {
+		http.Error(w, "no such job", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	io.WriteString(w, strings.Join(lines, "\n"))
+}
+
+// handleJobDismiss removes one finished job, or every finished job when
+// id=finished. Running and queued jobs can't be dismissed.
+func handleJobDismiss(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	jobsMu.Lock()
+	kept := jobs[:0]
+	for _, j := range jobs {
+		if !j.active() && (id == "finished" || j.ID == id) {
+			continue
+		}
+		kept = append(kept, j)
+	}
+	jobs = kept
+	jobsMu.Unlock()
+	saveJobs()
+	w.WriteHeader(http.StatusNoContent)
 }
