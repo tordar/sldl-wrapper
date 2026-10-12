@@ -192,6 +192,7 @@ button.search-btn:hover { background: var(--a2); }
   padding: 0.15rem 0.3rem;
 }
 .dl-link:hover { color: var(--t2); }
+.dl-link.err, .dl-link.err:hover { color: var(--err); }
 .dl-x { font-size: 1.05rem; line-height: 1; }
 .dl-list { overflow-y: auto; }
 .dl-list::-webkit-scrollbar { width: 3px; }
@@ -1218,6 +1219,21 @@ function alertInPanel(msg) {
   list.prepend(d);
 }
 
+// Cancel takes two taps: the first arms it for a few seconds.
+let cancelArmed = null;
+function armCancel(id) {
+  cancelArmed = id;
+  renderJobs();
+  setTimeout(() => { if (cancelArmed === id) { cancelArmed = null; renderJobs(); } }, 4000);
+}
+
+async function cancelJob(id) {
+  cancelArmed = null;
+  const r = await fetch(`/jobs/cancel?id=${encodeURIComponent(id)}`, { method: 'POST' });
+  if (!r.ok) alertInPanel(`Could not cancel: ${await r.text()}`);
+  refreshJobs();
+}
+
 async function dismissJob(id) {
   await fetch(`/jobs/dismiss?id=${encodeURIComponent(id)}`, { method: 'POST' });
   openTracks.delete(id); openLogs.delete(id);
@@ -1285,6 +1301,7 @@ const BADGE = {
   done:        ['done', 'done'],
   failed:      ['failed', 'failed'],
   interrupted: ['interrupted', 'failed'],
+  cancelled:   ['cancelled', 'warn'],
 };
 
 function jobHTML(j, log) {
@@ -1322,6 +1339,8 @@ function jobHTML(j, log) {
     } else {
       out.push(`<div class="job-line">${esc(line)}…</div>`);
     }
+  } else if (j.status === 'cancelled') {
+    out.push(`<div class="job-line warn">${esc(j.phase || 'Cancelled')}</div>`);
   } else if (j.status === 'done') {
     const t = j.tag;
     if (!j.saved) {
@@ -1343,6 +1362,11 @@ function jobHTML(j, log) {
   (j.notes || []).forEach(n => out.push(`<div class="job-sub">${esc(n)}</div>`));
 
   const acts = [];
+  if (j.status === 'queued' || j.status === 'downloading') {
+    acts.push(cancelArmed === j.id
+      ? `<button class="dl-link err" onclick="cancelJob('${j.id}')">tap again to cancel and delete partial files</button>`
+      : `<button class="dl-link" onclick="armCancel('${j.id}')">cancel</button>`);
+  }
   if (tracks.length) acts.push(`<button class="dl-link" onclick="toggleSet(openTracks,'${j.id}')">${openTracks.has(j.id) ? 'hide' : 'show'} tracks</button>`);
   acts.push(`<button class="dl-link" onclick="toggleSet(openLogs,'${j.id}')">${openLogs.has(j.id) ? 'hide' : 'show'} full log</button>`);
   out.push(`<div class="job-actions">${acts.join('')}</div>`);

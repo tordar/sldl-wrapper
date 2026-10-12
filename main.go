@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,8 @@ type DownloadJob struct {
 	startTime time.Time
 	output    chan string
 	exitErr   chan error
+	// onStart, if set, gets the running process (so a download can be cancelled).
+	onStart func(*os.Process)
 }
 
 // jobQueue runs downloads (and previews, unless a preview account is set) one
@@ -107,6 +110,9 @@ func jobWorker(queue chan *DownloadJob) {
 			continue
 		}
 		pw.Close()
+		if job.onStart != nil {
+			job.onStart(job.cmd.Process)
+		}
 
 		scanner := bufio.NewScanner(pr)
 		scanner.Buffer(make([]byte, 10*1024*1024), 10*1024*1024)
@@ -287,6 +293,7 @@ func main() {
 	http.HandleFunc("/jobs", handleJobs)
 	http.HandleFunc("/jobs/log", handleJobLog)
 	http.HandleFunc("/jobs/dismiss", handleJobDismiss)
+	http.HandleFunc("/jobs/cancel", handleJobCancel)
 
 	go jobWorker(jobQueue)
 	if _, _, separate := previewCredentials(); separate {
@@ -305,6 +312,9 @@ func main() {
 }
 
 func serveIndex(w http.ResponseWriter, r *http.Request) {
+	// Revalidate every load: a tab restored from an old cached page would talk
+	// to the current API with a stale client.
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeFile(w, r, "static/index.html")
 }
 
@@ -737,12 +747,13 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 // each output line to onLine, and returns the collected significant error
 // lines plus the exit error. The process is deliberately not tied to any
 // request context: a download must survive the browser tab closing.
-func runSldlAndStream(onLine func(string), args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
+func runSldlAndStream(onLine func(string), onStart func(*os.Process), args []string, outDir string) (sigLines []string, startTime time.Time, exitErr error) {
 	job := &DownloadJob{
 		cmd:     exec.Command(sldlBinary, args...),
 		outDir:  outDir,
 		output:  make(chan string, 200),
 		exitErr: make(chan error, 1),
+		onStart: onStart,
 	}
 
 	jobQueue <- job
@@ -814,11 +825,26 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 	downloadMu.Lock()
 	defer downloadMu.Unlock()
 
-	job.setStatus("downloading", "Connecting to Soulseek")
+	// A job cancelled while queued is already finished; don't revive it.
+	if !job.enter("downloading", "Connecting to Soulseek") {
+		return
+	}
 	onLine := func(line string) { job.sldlLine(line) }
+	onStart := func(p *os.Process) {
+		job.update(func(j *Job) {
+			j.proc = p
+			if j.cancelled {
+				p.Kill()
+			}
+		})
+	}
 
 	args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album, "--no-progress")
-	sigLines, startTime, exitErr := runSldlAndStream(onLine, args, outDir)
+	sigLines, startTime, exitErr := runSldlAndStream(onLine, onStart, args, outDir)
+	if job.isCancelled() {
+		finishCancelled(job, outDir, startTime)
+		return
+	}
 
 	saved := findSavedAlbums(outDir, startTime)
 
@@ -838,7 +864,11 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 			job.addLog(fmt.Sprintf("[fallback] direct URL failed; retrying with search %q", fallbackQuery))
 
 			retryArgs := buildSldlArgs(username, password, outDir, fallbackQuery, bitrate, req.Album, "--no-progress")
-			retrySig, retryStart, retryErr := runSldlAndStream(onLine, retryArgs, outDir)
+			retrySig, retryStart, retryErr := runSldlAndStream(onLine, onStart, retryArgs, outDir)
+			if job.isCancelled() {
+				finishCancelled(job, outDir, startTime)
+				return
+			}
 			sigLines = append(sigLines, retrySig...)
 			saved = findSavedAlbums(outDir, retryStart)
 			if len(saved) == 0 && retryErr != nil {
@@ -867,11 +897,12 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 	}
 
 	log.Printf("download %q saved to %s", req.Query, saved[0])
-	job.update(func(j *Job) {
-		j.Saved = saved[0]
-		j.Status = "tagging"
-		j.Phase = "Matching against MusicBrainz"
-	})
+	// Tagging can't be cancelled: the files are complete by now.
+	if !job.enter("tagging", "Matching against MusicBrainz") {
+		finishCancelled(job, outDir, startTime)
+		return
+	}
+	job.update(func(j *Job) { j.Saved = saved[0] })
 	saveJobs()
 	runBeets(func(format string, a ...any) { job.beetsLine(fmt.Sprintf(format, a...)) }, saved[0])
 	job.finish("done", func(j *Job) {
@@ -924,7 +955,9 @@ type Job struct {
 	Finished *time.Time `json:"finished,omitempty"`
 	Log      []string   `json:"log,omitempty"`
 
-	beetsExpect string // which beets value the next output line carries
+	beetsExpect string      // which beets value the next output line carries
+	cancelled   bool        // set by /jobs/cancel
+	proc        *os.Process // the running sldl, killed on cancel
 }
 
 var (
@@ -968,6 +1001,75 @@ func (j *Job) update(fn func(j *Job)) {
 func (j *Job) setStatus(status, phase string) {
 	j.update(func(j *Job) { j.Status, j.Phase = status, phase })
 	saveJobs()
+}
+
+// enter moves the job to status unless it has been cancelled, in which case it
+// reports false. Checked under the lock so a cancel can't be overwritten.
+func (j *Job) enter(status, phase string) bool {
+	ok := true
+	j.update(func(j *Job) {
+		if j.cancelled {
+			ok = false
+			return
+		}
+		j.Status, j.Phase = status, phase
+	})
+	if ok {
+		saveJobs()
+	}
+	return ok
+}
+
+func (j *Job) isCancelled() bool {
+	jobsMu.Lock()
+	defer jobsMu.Unlock()
+	return j.cancelled
+}
+
+// finishCancelled deletes whatever the cancelled download wrote, so no half
+// album is left in the library.
+func finishCancelled(job *Job, outDir string, since time.Time) {
+	n := removeFilesSince(outDir, since, job.addLog)
+	log.Printf("download %q cancelled; removed %d file(s)", job.Query, n)
+	job.finish("cancelled", func(j *Job) {
+		j.proc = nil
+		j.Phase = fmt.Sprintf("Cancelled. Removed %d partial file(s)", n)
+	})
+}
+
+// removeFilesSince deletes files under dir modified after since, then any
+// directories that leaves empty (dir itself too, unless it is the music root).
+// downloadMu guarantees nothing else downloads into the library meanwhile.
+func removeFilesSince(dir string, since time.Time, logf func(string)) int {
+	if since.IsZero() {
+		return 0
+	}
+	n := 0
+	var dirs []string
+	filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			dirs = append(dirs, path)
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.ModTime().After(since) {
+			if os.Remove(path) == nil {
+				n++
+				logf("[cancel] removed " + path)
+			}
+		}
+		return nil
+	})
+	// Deepest first, so parents empty out after their children.
+	sort.Slice(dirs, func(a, b int) bool { return len(dirs[a]) > len(dirs[b]) })
+	for _, d := range dirs {
+		if d != musicDir {
+			os.Remove(d) // fails harmlessly unless empty
+		}
+	}
+	return n
 }
 
 func (j *Job) finish(status string, fn func(j *Job)) {
@@ -1226,6 +1328,43 @@ func handleJobLog(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	io.WriteString(w, strings.Join(lines, "\n"))
+}
+
+// handleJobCancel stops a queued or downloading job; runDownload then removes
+// the files it had written. A job that is already tagging has a complete album
+// and can't be cancelled.
+func handleJobCancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id := r.URL.Query().Get("id")
+	jobsMu.Lock()
+	var job *Job
+	for _, j := range jobs {
+		if j.ID == id {
+			job = j
+		}
+	}
+	if job == nil || (job.Status != "queued" && job.Status != "downloading") {
+		jobsMu.Unlock()
+		http.Error(w, "job is not queued or downloading", http.StatusConflict)
+		return
+	}
+	job.cancelled = true
+	if job.Status == "queued" {
+		// Still waiting for the download lock: nothing written yet.
+		now := time.Now()
+		job.Status, job.Phase, job.Finished = "cancelled", "Cancelled before it started", &now
+	} else {
+		job.Phase = "Cancelling"
+		if job.proc != nil {
+			job.proc.Kill()
+		}
+	}
+	jobsMu.Unlock()
+	saveJobs()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleJobDismiss removes one finished job, or every finished job when
