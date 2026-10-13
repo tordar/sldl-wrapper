@@ -906,7 +906,7 @@ function openModal(item) {
 
   // Results area: start searching immediately
   const resultsArea = document.getElementById('modal-results');
-  resultsArea.innerHTML = '<div style="color:var(--t3);font-style:italic;">Connecting to Soulseek…</div>';
+  resultsArea.innerHTML = '<div style="color:var(--t3);font-style:italic;">Searching Soulseek…</div>';
 
   document.getElementById('modal-overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
@@ -1088,7 +1088,9 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
   if (!Array.isArray(results) || results.length === 0) {
     const s = document.createElement('span');
     s.className = 'preview-line-err';
-    s.textContent = 'Nobody on Soulseek is sharing this right now.';
+    // Soulseek silently drops searches from an account that searched a lot in
+    // the last few minutes, which looks exactly like an empty result.
+    s.textContent = 'Nobody on Soulseek is sharing this right now. If several searches in a row came back empty, Soulseek is probably throttling: try again in a few minutes.';
     area.appendChild(s);
     return;
   }

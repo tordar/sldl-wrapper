@@ -14,4 +14,22 @@ services:
       - SLDL_PASS=${SLDL_PASS}
       - SLDL_PREVIEW_USER=${SLDL_PREVIEW_USER:-}
       - SLDL_PREVIEW_PASS=${SLDL_PREVIEW_PASS:-}
+      - SLSKD_URL=http://slskd:5030
+    depends_on:
+      - slskd
+    restart: unless-stopped
+
+  # Search-only Soulseek client for previews and the download fallback. It
+  # stays logged in as the preview account, so sldl must never log in with
+  # that account while this runs (one login per account). No shares, no
+  # downloads, and no published ports: only sldl-wrapper reaches it.
+  slskd:
+    image: slskd/slskd:0.24.5
+    container_name: slskd-search
+    environment:
+      - SLSKD_SLSK_USERNAME=${SLDL_PREVIEW_USER}
+      - SLSKD_SLSK_PASSWORD=${SLDL_PREVIEW_PASS}
+      - SLSKD_NO_AUTH=true
+    volumes:
+      - /volume1/docker/slskd-search/app:/app
     restart: unless-stopped

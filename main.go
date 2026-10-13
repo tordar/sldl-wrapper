@@ -2,6 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -275,6 +278,7 @@ type slskResult struct {
 		Filename string
 		Length   int // seconds
 		Bitrate  int
+		Size     int64
 	}
 }
 
@@ -785,6 +789,11 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if slskdURL != "" {
+		previewSlskd(w, r, req.Query)
+		return
+	}
+
 	username, password, separate := previewCredentials()
 	if username == "" || password == "" {
 		http.Error(w, "SLDL_USER or SLDL_PASS not set", http.StatusInternalServerError)
@@ -850,6 +859,33 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 			log.Printf("preview %q: unparseable output %q", req.Query, sigLines)
 			rawJSON, _ := json.Marshal(fullOutput)
 			emit("[results-raw] %s", rawJSON)
+		}
+		emit("[preview-done]")
+	})
+}
+
+// previewSlskd is /preview through slskd: same SSE events as the sldl path,
+// plus a running count of users that have responded.
+func previewSlskd(w http.ResponseWriter, r *http.Request, query string) {
+	serveSSE(w, r, func(emit emitFunc) {
+		start := time.Now()
+		emit("[log] Searching Soulseek…")
+		results, err := searchSlskd(r.Context(), query, func(users int) {
+			if users > 0 {
+				emit("[log] %d user(s) responded…", users)
+			}
+		})
+		switch {
+		case err != nil:
+			log.Printf("preview %q failed: %v", query, err)
+			emit("[preview-error] Search failed: %v", err)
+		default:
+			log.Printf("preview %q: %d result(s) in %.1fs", query, len(results), time.Since(start).Seconds())
+			if results == nil {
+				results = []slskResult{}
+			}
+			b, _ := json.Marshal(results)
+			emit("[results] %s", b)
 		}
 		emit("[preview-done]")
 	})
@@ -1021,6 +1057,186 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 	})
 }
 
+// --- slskd search ---
+
+// slskdURL points at a search-only slskd logged in as the preview account.
+// When set, previews and the download fallback search through it: it stays
+// logged in, so a search takes seconds instead of a fresh sldl login plus
+// sldl's long result wait. Unset, both fall back to sldl.
+var slskdURL = strings.TrimRight(os.Getenv("SLSKD_URL"), "/")
+
+const (
+	// slskd ends a search this long after the last response. Nearly all
+	// responses arrive in the first 2-3s; the rest are slow stragglers.
+	slskdIdleTimeout = 3000 // ms
+	// slskdMaxSearch cancels a search that keeps trickling in.
+	slskdMaxSearch = 8 * time.Second
+)
+
+var slskdClient = &http.Client{Timeout: 15 * time.Second}
+
+type slskdResponse struct {
+	Username          string  `json:"username"`
+	HasFreeUploadSlot bool    `json:"hasFreeUploadSlot"`
+	UploadSpeed       float64 `json:"uploadSpeed"` // bytes/s
+	Files             []struct {
+		Filename string `json:"filename"`
+		Length   int    `json:"length"`
+		BitRate  int    `json:"bitRate"`
+		Size     int64  `json:"size"`
+	} `json:"files"`
+}
+
+func slskdCall(ctx context.Context, method, path string, body, out any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, slskdURL+"/api/v0"+path, rd)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := slskdClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		return fmt.Errorf("slskd %s %s: %s %s", method, path, resp.Status, strings.TrimSpace(string(msg)))
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
+}
+
+// slskdSearchText turns "Artist - Album" into Soulseek search words. A word
+// starting with "-" excludes results on Soulseek, so dashes are dropped.
+func slskdSearchText(q string) string {
+	var words []string
+	for _, w := range strings.Fields(sanitizeQuery(q)) {
+		if w = strings.TrimLeft(w, "-"); w != "" {
+			words = append(words, w)
+		}
+	}
+	return strings.Join(words, " ")
+}
+
+func newUUID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+// searchSlskd runs one Soulseek search through slskd and returns the matching
+// files grouped into one result per user folder (the shape sldl's
+// `--print json-all` gives), uploaders with a free slot and then the fastest
+// first. progress, if set, gets the number of users that have responded.
+func searchSlskd(ctx context.Context, query string, progress func(users int)) ([]slskResult, error) {
+	id := newUUID()
+	err := slskdCall(ctx, http.MethodPost, "/searches", map[string]any{
+		"id": id, "searchText": slskdSearchText(query), "searchTimeout": slskdIdleTimeout,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	// slskd keeps every search until deleted.
+	defer slskdCall(context.Background(), http.MethodDelete, "/searches/"+id, nil, nil)
+
+	deadline := time.Now().Add(slskdMaxSearch)
+	stopped, seen := false, -1
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+		var st struct {
+			IsComplete    bool `json:"isComplete"`
+			ResponseCount int  `json:"responseCount"`
+		}
+		if err := slskdCall(ctx, http.MethodGet, "/searches/"+id, nil, &st); err != nil {
+			return nil, err
+		}
+		if progress != nil && st.ResponseCount != seen {
+			seen = st.ResponseCount
+			progress(seen)
+		}
+		if st.IsComplete {
+			break
+		}
+		// Responses are only served once a search ends, so stop stragglers.
+		if !stopped && time.Now().After(deadline) {
+			stopped = true
+			if err := slskdCall(ctx, http.MethodPut, "/searches/"+id, nil, nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// slskd reports a search complete a moment before it has stored the
+	// responses, so re-read until they match the count (or give up after 3s).
+	var responses []slskdResponse
+	for try := 0; ; try++ {
+		if err := slskdCall(ctx, http.MethodGet, "/searches/"+id+"/responses", nil, &responses); err != nil {
+			return nil, err
+		}
+		var st struct {
+			ResponseCount int `json:"responseCount"`
+		}
+		if err := slskdCall(ctx, http.MethodGet, "/searches/"+id, nil, &st); err != nil {
+			return nil, err
+		}
+		if len(responses) >= st.ResponseCount || try == 12 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	sort.SliceStable(responses, func(i, j int) bool {
+		a, b := responses[i], responses[j]
+		if a.HasFreeUploadSlot != b.HasFreeUploadSlot {
+			return a.HasFreeUploadSlot
+		}
+		return a.UploadSpeed > b.UploadSpeed
+	})
+	var results []slskResult
+	for _, resp := range responses {
+		folders := map[string]int{} // folder -> index in results
+		for _, f := range resp.Files {
+			dir := f.Filename[:max(strings.LastIndex(f.Filename, `\`), 0)]
+			i, ok := folders[dir]
+			if !ok {
+				var r slskResult
+				r.User.Username = resp.Username
+				r.User.HasFreeUploadSlot = resp.HasFreeUploadSlot
+				r.User.UploadSpeed = resp.UploadSpeed / 1e6
+				results = append(results, r)
+				i = len(results) - 1
+				folders[dir] = i
+			}
+			results[i].Files = append(results[i].Files, struct {
+				Filename string
+				Length   int
+				Bitrate  int
+				Size     int64
+			}{f.Filename, f.Length, f.BitRate, f.Size})
+		}
+	}
+	return results, nil
+}
+
 // fallbackAlbum searches req.FallbackQuery for folders holding the whole
 // req.Tracks at the bitrate floor and downloads the best one, trying the next
 // when a source fails. Without a tracklist nothing is tried.
@@ -1043,16 +1259,25 @@ func fallbackAlbum(job *Job, req DownloadRequest, username, password, outDir str
 	})
 	job.addLog(fmt.Sprintf("[fallback] direct URL failed; searching %q for all %d tracks at %sk+", req.FallbackQuery, len(req.Tracks), minBitrate))
 
-	// The search's JSON is collected, not parsed as download progress.
-	var out []string
-	searchArgs := buildSldlArgs(username, password, "", req.FallbackQuery, "", true, "--print", "json-all")
-	sig, _, err := runSldlAndStream(func(l string) { out = append(out, l) }, onStart, searchArgs, outDir)
+	var results []slskResult
+	var sig []string
+	if slskdURL != "" {
+		var err error
+		if results, err = searchSlskd(context.Background(), req.FallbackQuery, nil); err != nil {
+			return nil, nil, err, false
+		}
+	} else {
+		// The search's JSON is collected, not parsed as download progress.
+		var out []string
+		searchArgs := buildSldlArgs(username, password, "", req.FallbackQuery, "", true, "--print", "json-all")
+		var err error
+		sig, _, err = runSldlAndStream(func(l string) { out = append(out, l) }, onStart, searchArgs, outDir)
+		if !extractJSONArray(strings.Join(out, "\n"), &results) && err != nil {
+			return nil, sig, err, false
+		}
+	}
 	if job.isCancelled() {
 		return nil, nil, nil, true
-	}
-	var results []slskResult
-	if !extractJSONArray(strings.Join(out, "\n"), &results) && err != nil {
-		return nil, sig, err, false
 	}
 	cands := fallbackCandidates(results, req.Tracks, failedUser)
 	job.addLog(fmt.Sprintf("[fallback] %d result(s), %d with the full tracklist at %sk+", len(results), len(cands), minBitrate))
