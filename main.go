@@ -864,17 +864,37 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// searchSlskdOrAlbum is searchSlskd, retried once with only the part after
+// "Artist - " when nobody answers: the Soulseek server silently blocks
+// searches containing some artist names (e.g. "Frank Ocean"), and the album
+// title alone still finds the folders. note, if set, is told about the retry.
+func searchSlskdOrAlbum(ctx context.Context, query string, progress func(int), note func(string)) ([]slskResult, error) {
+	results, err := searchSlskd(ctx, query, progress)
+	if err != nil || len(results) > 0 {
+		return results, err
+	}
+	_, album, ok := strings.Cut(query, " - ")
+	if !ok || slskdSearchText(album) == "" {
+		return results, nil
+	}
+	if note != nil {
+		note("Nobody answered; Soulseek may block this artist's name. Retrying with the album title only…")
+	}
+	log.Printf("search %q: no answers, retrying as %q", query, album)
+	return searchSlskd(ctx, album, progress)
+}
+
 // previewSlskd is /preview through slskd: same SSE events as the sldl path,
 // plus a running count of users that have responded.
 func previewSlskd(w http.ResponseWriter, r *http.Request, query string) {
 	serveSSE(w, r, func(emit emitFunc) {
 		start := time.Now()
 		emit("[log] Searching Soulseek…")
-		results, err := searchSlskd(r.Context(), query, func(users int) {
+		results, err := searchSlskdOrAlbum(r.Context(), query, func(users int) {
 			if users > 0 {
 				emit("[log] %d user(s) responded…", users)
 			}
-		})
+		}, func(msg string) { emit("[log] %s", msg) })
 		switch {
 		case err != nil:
 			log.Printf("preview %q failed: %v", query, err)
@@ -1116,14 +1136,20 @@ func slskdCall(ctx context.Context, method, path string, body, out any) error {
 	return nil
 }
 
-// slskdSearchText turns "Artist - Album" into Soulseek search words. A word
-// starting with "-" excludes results on Soulseek, so dashes are dropped.
+// slskdSearchText turns "Artist - Album" into Soulseek search words.
+// Soulseek matches whole words, so punctuation splits words ("nostalgia,ULTRA."
+// matches nothing; "nostalgia ULTRA" does), and one-letter leftovers like the
+// "s" of "What's" are dropped. This also removes "-", which would exclude.
 func slskdSearchText(q string) string {
+	parts := strings.FieldsFunc(q, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
 	var words []string
-	for _, w := range strings.Fields(sanitizeQuery(q)) {
-		if w = strings.TrimLeft(w, "-"); w != "" {
+	for _, w := range parts {
+		if len([]rune(w)) > 1 {
 			words = append(words, w)
 		}
+	}
+	if len(words) == 0 {
+		return strings.Join(parts, " ")
 	}
 	return strings.Join(words, " ")
 }
@@ -1263,7 +1289,7 @@ func fallbackAlbum(job *Job, req DownloadRequest, username, password, outDir str
 	var sig []string
 	if slskdURL != "" {
 		var err error
-		if results, err = searchSlskd(context.Background(), req.FallbackQuery, nil); err != nil {
+		if results, err = searchSlskdOrAlbum(context.Background(), req.FallbackQuery, nil, job.addLog); err != nil {
 			return nil, nil, err, false
 		}
 	} else {
