@@ -725,7 +725,7 @@ function renderResults(data, type) {
 
   if (type === 'track') {
     items = (data.recordings || []).map(r => {
-      const artist = (r['artist-credit'] || []).map(a => a.name || a.artist?.name).join('');
+      const artist = (r['artist-credit'] || []).map(a => (a.name || a.artist?.name || '') + (a.joinphrase || '')).join('');
       const rel    = (r.releases || [])[0];
       return {
         id: r.id,
@@ -742,7 +742,7 @@ function renderResults(data, type) {
     });
   } else {
     items = (data['release-groups'] || []).map(r => {
-      const artist = (r['artist-credit'] || []).map(a => a.name || a.artist?.name).join('');
+      const artist = (r['artist-credit'] || []).map(a => (a.name || a.artist?.name || '') + (a.joinphrase || '')).join('');
       const secondaryTypes = r['secondary-types'] || [];
       return {
         id: r.id,
@@ -846,7 +846,7 @@ function renderResults(data, type) {
     const dlBtn = document.createElement('button');
     dlBtn.className = 'dl-btn';
     dlBtn.textContent = '↓ Download';
-    dlBtn.onclick = () => openModal(item);
+    dlBtn.onclick = () => item.isAlbum ? autoDownload(item, dlBtn) : openModal(item);
     actions.appendChild(dlBtn);
 
     main.append(artWrap, body, actions);
@@ -867,7 +867,9 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal()
 
 let currentItem = null;
 
-function openModal(item) {
+// prefilled: a results element from a search already run (autoDownload found
+// no full copy), shown instead of searching again.
+function openModal(item, prefilled = null) {
   currentItem = item;
   if (currentAbortController) currentAbortController.abort();
   currentAbortController = new AbortController();
@@ -911,6 +913,10 @@ function openModal(item) {
   document.getElementById('modal-overlay').classList.add('open');
   document.body.style.overflow = 'hidden';
 
+  if (prefilled) {
+    resultsArea.replaceChildren(...prefilled.childNodes);
+    return;
+  }
   startModalPreview(item.query, item.isAlbum, item.artist, tracksPromise, resultsArea, currentAbortController.signal);
 }
 
@@ -923,28 +929,48 @@ function closeModal() {
   document.body.style.overflow = '';
 }
 
+async function fetchTracks(mbid) {
+  if (trackCache[mbid]) return trackCache[mbid];
+  const r = await fetch(`/release-group?id=${encodeURIComponent(mbid)}`);
+  const data = await r.json();
+  const tracks = (data.media || []).flatMap(m =>
+    (m.tracks || []).map(t => ({
+      num:    t.number ?? t.position,
+      title:  t.title || t.recording?.title || '',
+      length: t.length || t.recording?.length || 0,
+    }))
+  );
+  trackCache[mbid] = tracks;
+  return tracks;
+}
+
 async function loadModalTracks(mbid, container) {
-  if (trackCache[mbid]) {
-    renderTracks(container, trackCache[mbid]);
-    return trackCache[mbid];
-  }
   try {
-    const r = await fetch(`/release-group?id=${encodeURIComponent(mbid)}`);
-    const data = await r.json();
-    const tracks = (data.media || []).flatMap(m =>
-      (m.tracks || []).map(t => ({
-        num:    t.number ?? t.position,
-        title:  t.title || t.recording?.title || '',
-        length: t.length || t.recording?.length || 0,
-      }))
-    );
-    trackCache[mbid] = tracks;
+    const tracks = await fetchTracks(mbid);
     renderTracks(container, tracks);
     return tracks;
   } catch (e) {
     container.innerHTML = '<div class="track-row" style="color:var(--err);border:none;">Failed to load tracks</div>';
     return [];
   }
+}
+
+// autoDownload searches in the background and downloads the best full 320k+
+// copy without showing anything but the button state. Only when there is no
+// such copy does the modal open, with the results of this same search.
+async function autoDownload(item, btn) {
+  if (btn.disabled) return;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Searching…';
+  const area = document.createElement('div');
+  area.innerHTML = '<div style="color:var(--t3);font-style:italic;">Searching Soulseek…</div>';
+  const tracksPromise = item.id ? fetchTracks(item.id).catch(() => []) : Promise.resolve([]);
+  const picked = await startModalPreview(item.query, true, item.artist, tracksPromise, area,
+    new AbortController().signal, `${item.artist} – ${item.label}`);
+  btn.disabled = false;
+  btn.textContent = label;
+  if (!picked) openModal(item, area);
 }
 
 function renderTracks(container, tracks) {
@@ -960,7 +986,8 @@ function renderTracks(container, tracks) {
     </div>`).join('');
 }
 
-async function startModalPreview(query, isAlbum, artist, tracksPromise, area, signal) {
+// Resolves true when renderModalResults picked a copy and started its download.
+async function startModalPreview(query, isAlbum, artist, tracksPromise, area, signal, label = '') {
   const statusEl = area.querySelector('div');
 
   try {
@@ -990,7 +1017,7 @@ async function startModalPreview(query, isAlbum, artist, tracksPromise, area, si
           if (statusEl && area.contains(statusEl)) {
             area.innerHTML = '<span class="preview-line-err">No results found.</span>';
           }
-          return;
+          return false;
         } else if (text.startsWith('[preview-error] ')) {
           if (statusEl && area.contains(statusEl)) area.innerHTML = '';
           const s = document.createElement('div');
@@ -1001,8 +1028,8 @@ async function startModalPreview(query, isAlbum, artist, tracksPromise, area, si
           try {
             const results = JSON.parse(text.slice(10));
             const tracks  = await tracksPromise;
-            if (signal.aborted) return;
-            renderModalResults(results, area, isAlbum, artist, query, tracks);
+            if (signal.aborted) return false;
+            if (renderModalResults(results, area, isAlbum, artist, query, tracks, label)) return true;
           } catch (e) {
             area.innerHTML = '';
             const s = document.createElement('pre');
@@ -1025,13 +1052,14 @@ async function startModalPreview(query, isAlbum, artist, tracksPromise, area, si
       }
     }
   } catch (e) {
-    if (e.name === 'AbortError') return;
+    if (e.name === 'AbortError') return false;
     area.innerHTML = '';
     const s = document.createElement('span');
     s.className = 'preview-line-err';
     s.textContent = 'Error: ' + e.message;
     area.appendChild(s);
   }
+  return false;
 }
 
 const MIN_BITRATE = 320;
@@ -1049,6 +1077,20 @@ function resultMinBitrate(result) {
     .map(f => f.BitRate || f.Bitrate || f.bitrate || 0)
     .filter(b => b > 0);
   return rates.length ? Math.min(...rates) : null;
+}
+
+const LOSSLESS_RE = /\.(flac|wav|alac|ape|wv)$/i;
+
+function isLossless(result) {
+  return resultAudioFiles(result).some(f => LOSSLESS_RE.test(f.Filename || f.FileName || f.filename || f.Name || ''));
+}
+
+function resultLink(result) {
+  const username = result.User?.Username || result.Username || result.username || '?';
+  const files    = result.Files || result.TrackFiles || result.files || [];
+  const first    = (files[0]?.Filename || files[0]?.FileName || '').replace(/\\/g, '/');
+  const dir      = first.includes('/') ? first.substring(0, first.lastIndexOf('/')) : '';
+  return `slsk://${username}/${dir.replace(/^\/+/, '')}`;
 }
 
 // Title key for matching files against the MusicBrainz tracklist: bracketed
@@ -1082,7 +1124,8 @@ function countTrackMatches(result, tracks) {
   return matched;
 }
 
-function renderModalResults(results, area, isAlbum, artist, query, tracks = []) {
+// Returns true when it picked a full copy and started downloading it.
+function renderModalResults(results, area, isAlbum, artist, query, tracks = [], label = '') {
   area.innerHTML = '';
 
   if (!Array.isArray(results) || results.length === 0) {
@@ -1092,7 +1135,7 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
     // the last few minutes, which looks exactly like an empty result.
     s.textContent = 'Nobody on Soulseek is sharing this right now. If several searches in a row came back empty, Soulseek is probably throttling: try again in a few minutes.';
     area.appendChild(s);
-    return;
+    return false;
   }
 
   // Show only 320k+ results when there are any; otherwise fall back to the
@@ -1108,7 +1151,11 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
   const complete  = tracks.length
     ? r => matches.get(r) * 2 >= tracks.length
     : r => resultAudioFiles(r).length * 2 >= maxTracks;
-  const byMatch = (a, b) => (matches.get(b) - matches.get(a)) || (extra(a) - extra(b));
+  // 320k MP3 before lossless (same tracklist, a tenth of the size), then
+  // uploaders with a free slot: the rest queue the download behind others.
+  const freeSlot = r => !!(r.User?.HasFreeUploadSlot);
+  const byMatch = (a, b) => (matches.get(b) - matches.get(a)) || (isLossless(a) - isLossless(b))
+    || (freeSlot(b) - freeSlot(a)) || (extra(a) - extra(b));
   const good = results.filter(r => {
     const b = resultMinBitrate(r);
     return complete(r) && (b === null || b >= MIN_BITRATE);
@@ -1121,11 +1168,28 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
     results = good;
   }
 
+  // Full copies at 320k+, best first. The first is downloaded right away; the
+  // rest go along so the server can try them when that source fails.
+  const full = lowBitrate || !tracks.length ? [] : results.filter(r => matches.get(r) === tracks.length);
+  if (!label && currentItem) label = `${currentItem.artist} – ${currentItem.label}`;
+  const pick = result => {
+    const link = resultLink(result);
+    const alternatives = full.filter(r => r !== result).slice(0, 3).map(resultLink);
+    closeModal();
+    download(link, isAlbum, artist, lowBitrate, label, query, tracks, alternatives);
+  };
+  if (isAlbum && full.length) {
+    pick(full[0]);
+    return true;
+  }
+
   const hdr = document.createElement('div');
   hdr.style.cssText = 'color:var(--t3);margin-bottom:0.4rem;padding-bottom:0.35rem;border-bottom:1px solid var(--b1);font-size:0.68rem;letter-spacing:0.03em;';
   hdr.textContent = lowBitrate
     ? `No ${MIN_BITRATE}k+ results. ${results.length} lower-bitrate alternative${results.length !== 1 ? 's' : ''}`
-    : `${results.length} result${results.length !== 1 ? 's' : ''} found`;
+    : isAlbum && tracks.length
+      ? `No copy with all ${tracks.length} tracks at ${MIN_BITRATE}k+. Closest ${results.length}:`
+      : `${results.length} result${results.length !== 1 ? 's' : ''} found`;
   area.appendChild(hdr);
 
   results.forEach(result => {
@@ -1134,8 +1198,6 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
     const firstFilename = (files[0]?.Filename || files[0]?.FileName || '').replace(/\\/g, '/');
     const dir           = firstFilename.includes('/') ? firstFilename.substring(0, firstFilename.lastIndexOf('/')) : '';
     const folderName    = dir.split('/').filter(Boolean).pop() || dir || '?';
-    const slskPath      = dir.replace(/\\/g, '/').replace(/^\/+/, '');
-    const slskLink      = `slsk://${username}/${slskPath}`;
 
     const card = document.createElement('div');
     card.className = 'preview-result-card';
@@ -1166,11 +1228,7 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
     dlBtn.className = 'preview-dl-btn';
     dlBtn.textContent = '↓ Download';
     dlBtn.style.flexShrink = '0';
-    dlBtn.onclick = () => {
-      closeModal();
-      const label = currentItem ? `${currentItem.artist} – ${currentItem.label}` : '';
-      download(slskLink, isAlbum, artist, lowBitrate, label, query, tracks);
-    };
+    dlBtn.onclick = () => pick(result);
 
     cardTop.append(info, dlBtn);
     card.appendChild(cardTop);
@@ -1212,6 +1270,7 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = []) 
 
     area.appendChild(card);
   });
+  return false;
 }
 
 function fmtDuration(ms) {
@@ -1240,14 +1299,14 @@ let lastJobs  = [];
 
 // fallbackQuery and tracks let the server look for another source when the
 // picked one fails; for an album it only takes one with every track at 320k+.
-async function download(query, album, subfolder, lowBitrate = false, label = '', fallbackQuery = '', tracks = []) {
+async function download(query, album, subfolder, lowBitrate = false, label = '', fallbackQuery = '', tracks = [], alternatives = []) {
   toggleDownloads(true);
   try {
     const r = await fetch('/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        query, album, subfolder, lowBitrate, label, fallbackQuery,
+        query, album, subfolder, lowBitrate, label, fallbackQuery, alternatives,
         tracks: tracks.map(t => ({ title: t.title, length: t.length || 0 })),
       }),
     });
