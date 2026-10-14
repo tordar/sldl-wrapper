@@ -152,6 +152,8 @@ button.search-btn:hover { background: var(--a2); }
 .header-right { display: flex; align-items: center; gap: 0.5rem; }
 .dl-toggle { display: inline-flex; align-items: center; gap: 0.4rem; }
 .dl-toggle.has-active { border-color: var(--a); color: var(--a2); }
+.dl-toggle.pulse { animation: dl-pulse 0.9s ease-out 2; }
+@keyframes dl-pulse { 0% { box-shadow: 0 0 0 0 var(--a); } 100% { box-shadow: 0 0 0 10px transparent; } }
 .dl-count {
   min-width: 1.1rem; padding: 0 0.3rem;
   border-radius: 999px;
@@ -392,6 +394,9 @@ button.search-btn:hover { background: var(--a2); }
   transition: background 0.15s, color 0.15s;
 }
 .dl-btn:hover { background: var(--a); color: #110e0b; }
+.result-actions .dl-btn + .dl-btn { margin-top: 0.3rem; }
+.dl-btn-alt { background: transparent; border-color: var(--b2); color: var(--t2); font-weight: 500; }
+.dl-btn-alt:hover { background: var(--b1); color: var(--t1); }
 
 /* ── MODAL ── */
 .modal-overlay {
@@ -607,7 +612,7 @@ button.search-btn:hover { background: var(--a2); }
   .result-meta { font-size: 0.64rem; }
   .result-meta2, .tag { display: none; }
 
-  #downloads { width: auto; right: 0.75rem; left: 0.75rem; bottom: 0.75rem; }
+  #downloads { width: auto; right: 0.75rem; left: 0.75rem; bottom: 0.75rem; max-height: 50vh; }
   .modal-tracks-col { display: none; }
 }
 </style>
@@ -712,6 +717,7 @@ async function search() {
 
   try {
     const r = await fetch(`/search?q=${encodeURIComponent(parts.join(' AND '))}&type=${searchType}`);
+    if (!r.ok) throw new Error(`${(await r.text()).trim()}. Try again in a few seconds.`);
     const data = await r.json();
     renderResults(data, searchType);
   } catch (e) {
@@ -848,6 +854,14 @@ function renderResults(data, type) {
     dlBtn.textContent = '↓ Download';
     dlBtn.onclick = () => item.isAlbum ? autoDownload(item, dlBtn) : openModal(item);
     actions.appendChild(dlBtn);
+    if (item.isAlbum) {
+      const pickBtn = document.createElement('button');
+      pickBtn.className = 'dl-btn dl-btn-alt';
+      pickBtn.textContent = 'Choose…';
+      pickBtn.title = 'Pick the copy and quality yourself';
+      pickBtn.onclick = () => openModal(item);
+      actions.appendChild(pickBtn);
+    }
 
     main.append(artWrap, body, actions);
     ri.appendChild(main);
@@ -932,6 +946,7 @@ function closeModal() {
 async function fetchTracks(mbid) {
   if (trackCache[mbid]) return trackCache[mbid];
   const r = await fetch(`/release-group?id=${encodeURIComponent(mbid)}`);
+  if (!r.ok) throw new Error((await r.text()).trim());
   const data = await r.json();
   const tracks = (data.media || []).flatMap(m =>
     (m.tracks || []).map(t => ({
@@ -967,10 +982,11 @@ async function autoDownload(item, btn) {
   area.innerHTML = '<div style="color:var(--t3);font-style:italic;">Searching Soulseek…</div>';
   const tracksPromise = item.id ? fetchTracks(item.id).catch(() => []) : Promise.resolve([]);
   const picked = await startModalPreview(item.query, true, item.artist, tracksPromise, area,
-    new AbortController().signal, `${item.artist} – ${item.label}`);
+    new AbortController().signal, `${item.artist} – ${item.label}`, true);
   btn.disabled = false;
-  btn.textContent = label;
-  if (!picked) openModal(item, area);
+  btn.textContent = picked ? '✓ Queued' : label;
+  if (picked) setTimeout(() => { btn.textContent = label; }, 2500);
+  else openModal(item, area);
 }
 
 function renderTracks(container, tracks) {
@@ -987,7 +1003,7 @@ function renderTracks(container, tracks) {
 }
 
 // Resolves true when renderModalResults picked a copy and started its download.
-async function startModalPreview(query, isAlbum, artist, tracksPromise, area, signal, label = '') {
+async function startModalPreview(query, isAlbum, artist, tracksPromise, area, signal, label = '', auto = false) {
   const statusEl = area.querySelector('div');
 
   try {
@@ -1029,7 +1045,7 @@ async function startModalPreview(query, isAlbum, artist, tracksPromise, area, si
             const results = JSON.parse(text.slice(10));
             const tracks  = await tracksPromise;
             if (signal.aborted) return false;
-            if (renderModalResults(results, area, isAlbum, artist, query, tracks, label)) return true;
+            if (renderModalResults(results, area, isAlbum, artist, query, tracks, label, auto)) return true;
           } catch (e) {
             area.innerHTML = '';
             const s = document.createElement('pre');
@@ -1125,7 +1141,8 @@ function countTrackMatches(result, tracks) {
 }
 
 // Returns true when it picked a full copy and started downloading it.
-function renderModalResults(results, area, isAlbum, artist, query, tracks = [], label = '') {
+// auto: download the best full 320k+ copy instead of listing (autoDownload).
+function renderModalResults(results, area, isAlbum, artist, query, tracks = [], label = '', auto = false) {
   area.innerHTML = '';
 
   if (!Array.isArray(results) || results.length === 0) {
@@ -1156,43 +1173,46 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = [], 
   const freeSlot = r => !!(r.User?.HasFreeUploadSlot);
   const byMatch = (a, b) => (matches.get(b) - matches.get(a)) || (isLossless(a) - isLossless(b))
     || (freeSlot(b) - freeSlot(a)) || (extra(a) - extra(b));
-  const good = results.filter(r => {
-    const b = resultMinBitrate(r);
-    return complete(r) && (b === null || b >= MIN_BITRATE);
-  }).sort(byMatch);
-  const lowBitrate = good.length === 0;
-  if (lowBitrate) {
-    results = [...results].sort((a, b) =>
-      (complete(b) - complete(a)) || byMatch(a, b) || ((resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0)));
-  } else {
-    results = good;
-  }
+  const minOK = r => { const b = resultMinBitrate(r); return b === null || b >= MIN_BITRATE; };
+  const good = results.filter(r => complete(r) && minOK(r)).sort(byMatch);
+  const rest = results.filter(r => !good.includes(r)).sort((a, b) =>
+    (complete(b) - complete(a)) || byMatch(a, b) || ((resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0)));
 
-  // Full copies at 320k+, best first. The first is downloaded right away; the
-  // rest go along so the server can try them when that source fails.
-  const full = lowBitrate || !tracks.length ? [] : results.filter(r => matches.get(r) === tracks.length);
+  // Full copies at 320k+, best first. autoDownload takes the first; the rest
+  // go along so the server can try them when that source fails.
+  const full = tracks.length ? good.filter(r => matches.get(r) === tracks.length) : [];
   if (!label && currentItem) label = `${currentItem.artist} – ${currentItem.label}`;
   const pick = result => {
     const link = resultLink(result);
     const alternatives = full.filter(r => r !== result).slice(0, 3).map(resultLink);
     closeModal();
-    download(link, isAlbum, artist, lowBitrate, label, query, tracks, alternatives);
+    download(link, isAlbum, artist, !minOK(result), label, query, tracks, alternatives);
   };
-  if (isAlbum && full.length) {
+  if (auto && isAlbum && full.length) {
     pick(full[0]);
     return true;
   }
 
+  // Everything is listed so any copy can be picked by hand: the full 320k+
+  // ones first, then lower-bitrate and incomplete ones, which download
+  // without the bitrate floor.
   const hdr = document.createElement('div');
   hdr.style.cssText = 'color:var(--t3);margin-bottom:0.4rem;padding-bottom:0.35rem;border-bottom:1px solid var(--b1);font-size:0.68rem;letter-spacing:0.03em;';
-  hdr.textContent = lowBitrate
-    ? `No ${MIN_BITRATE}k+ results. ${results.length} lower-bitrate alternative${results.length !== 1 ? 's' : ''}`
+  hdr.textContent = full.length || (!tracks.length && good.length)
+    ? `${good.length} ${MIN_BITRATE}k+ result${good.length !== 1 ? 's' : ''}`
     : isAlbum && tracks.length
-      ? `No copy with all ${tracks.length} tracks at ${MIN_BITRATE}k+. Closest ${results.length}:`
-      : `${results.length} result${results.length !== 1 ? 's' : ''} found`;
+      ? `No copy with all ${tracks.length} tracks at ${MIN_BITRATE}k+`
+      : `No ${MIN_BITRATE}k+ results`;
   area.appendChild(hdr);
+  results = [...good, ...rest];
 
-  results.forEach(result => {
+  results.forEach((result, i) => {
+    if (i === good.length && rest.length) {
+      const sep = document.createElement('div');
+      sep.style.cssText = hdr.style.cssText + 'margin-top:0.6rem;';
+      sep.textContent = `${rest.length} lower-bitrate or incomplete`;
+      area.appendChild(sep);
+    }
     const username      = result.User?.Username || result.Username || result.username || '?';
     const files         = result.Files || result.TrackFiles || result.files || [];
     const firstFilename = (files[0]?.Filename || files[0]?.FileName || '').replace(/\\/g, '/');
@@ -1213,7 +1233,8 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = [], 
     const minRate = resultMinBitrate(result);
     const userParts = [username];
     if (tracks.length) userParts.push(`${matches.get(result)}/${tracks.length} tracks`);
-    if (lowBitrate && minRate) userParts.push(`min ${minRate}k`);
+    if (isLossless(result)) userParts.push('lossless');
+    else if (minRate) userParts.push(`${minRate}k`);
     userLine.textContent = userParts.join(' · ');
 
     const folderLine = document.createElement('div');
@@ -1299,8 +1320,9 @@ let lastJobs  = [];
 
 // fallbackQuery and tracks let the server look for another source when the
 // picked one fails; for an album it only takes one with every track at 320k+.
+// Starting a download doesn't open the panel (on a phone it covers the
+// results); the downloads button pulses and its count goes up instead.
 async function download(query, album, subfolder, lowBitrate = false, label = '', fallbackQuery = '', tracks = [], alternatives = []) {
-  toggleDownloads(true);
   try {
     const r = await fetch('/download', {
       method: 'POST',
@@ -1311,7 +1333,12 @@ async function download(query, album, subfolder, lowBitrate = false, label = '',
       }),
     });
     if (!r.ok) throw new Error(await r.text());
+    const btn = document.getElementById('dl-toggle');
+    btn.classList.remove('pulse');
+    void btn.offsetWidth; // restart the animation
+    btn.classList.add('pulse');
   } catch (e) {
+    toggleDownloads(true);
     alertInPanel(`Could not start download: ${e.message}`);
   }
   refreshJobs();

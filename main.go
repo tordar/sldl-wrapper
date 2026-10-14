@@ -467,7 +467,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := mbDo(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -476,6 +476,31 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	io.Copy(w, resp.Body)
+}
+
+// mbDo sends a MusicBrainz request, retrying when MusicBrainz answers 503
+// ("server is currently busy", its rate limit), which happens several times
+// a day. A response that is still not 200 becomes an error, so it never
+// reaches the UI looking like an empty result.
+func mbDo(req *http.Request) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable || attempt == 3 {
+			return nil, fmt.Errorf("MusicBrainz answered %s", resp.Status)
+		}
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case <-time.After(time.Duration(attempt+1) * time.Second):
+		}
+	}
 }
 
 func handleRelease(w http.ResponseWriter, r *http.Request) {
@@ -493,7 +518,7 @@ func handleRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := mbDo(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -518,7 +543,7 @@ func handleReleaseGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("User-Agent", userAgent)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := mbDo(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -568,7 +593,7 @@ func handleReleaseGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req2.Header.Set("User-Agent", userAgent)
-	resp2, err := http.DefaultClient.Do(req2)
+	resp2, err := mbDo(req2)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -1022,19 +1047,21 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 		})
 	}
 
-	args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album, "--no-progress")
-	stop := func() {}
-	if req.Album && len(req.Alternatives) > 0 {
-		stop = killIfStalled(job)
+	var saved, sigLines []string
+	var startTime time.Time
+	var exitErr error
+	if req.Album && len(req.Tracks) > 0 && strings.HasPrefix(req.Query, "slsk://") {
+		startTime = time.Now()
+		saved, sigLines, exitErr = downloadAlbumSource(job, req.Query, bitrate, req.Tracks, len(req.Alternatives) > 0, username, password, outDir, onLine, onStart)
+	} else {
+		args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album, "--no-progress")
+		sigLines, startTime, exitErr = runSldlAndStream(onLine, onStart, args, outDir)
+		saved = findSavedAlbums(outDir, startTime)
 	}
-	sigLines, startTime, exitErr := runSldlAndStream(onLine, onStart, args, outDir)
-	stop()
 	if job.isCancelled() {
 		finishCancelled(job, outDir, startTime)
 		return
 	}
-
-	saved := findSavedAlbums(outDir, startTime)
 
 	// If a slsk:// source produced no usable album (most often an offline or
 	// slot-starved user), look for another copy. An album is only taken from a
@@ -1369,7 +1396,7 @@ func fallbackAlbum(job *Job, req DownloadRequest, username, password, outDir str
 		})
 		return nil, sig, nil, false
 	}
-	return tryFallbackCandidates(job, cands, username, password, outDir, onLine, onStart)
+	return tryFallbackCandidates(job, cands, req.Tracks, username, password, outDir, onLine, onStart)
 }
 
 // searchFallback searches req.FallbackQuery and returns the full copies at
@@ -1397,7 +1424,7 @@ func searchFallback(job *Job, req DownloadRequest, username, password, outDir, f
 
 // tryFallbackCandidates downloads the first of cands (at most 3 tried) that
 // saves an album.
-func tryFallbackCandidates(job *Job, cands []string, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error, cancelled bool) {
+func tryFallbackCandidates(job *Job, cands []string, tracks []ExpectedTrack, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error, cancelled bool) {
 	const maxTries = 3
 	for i, cand := range cands[:min(len(cands), maxTries)] {
 		user := strings.TrimPrefix(cand, "slsk://")
@@ -1410,24 +1437,117 @@ func tryFallbackCandidates(job *Job, cands []string, username, password, outDir 
 			j.Notes = append(j.Notes, fmt.Sprintf("Trying %s (full tracklist, %d of %d)", user, i+1, min(len(cands), maxTries)))
 		})
 		job.addLog(fmt.Sprintf("[fallback] trying %s", cand))
-		args := buildSldlArgs(username, password, outDir, cand, minBitrate, true, "--no-progress")
-		stop := func() {}
-		if i < min(len(cands), maxTries)-1 {
-			stop = killIfStalled(job)
-		}
-		sig, start, err := runSldlAndStream(onLine, onStart, args, outDir)
-		stop()
+		start := time.Now()
+		saved, sig, err := downloadAlbumSource(job, cand, minBitrate, tracks, i < min(len(cands), maxTries)-1, username, password, outDir, onLine, onStart)
 		if job.isCancelled() {
 			return nil, nil, nil, true
 		}
 		sigLines = append(sigLines, sig...)
-		if saved = findSavedAlbums(outDir, start); len(saved) > 0 {
+		if len(saved) > 0 {
 			return saved, sigLines, nil, false
 		}
 		exitErr = err
 		removeFailedParents(outDir, findFailedAlbums(outDir, start), job.addLog)
 	}
+	if exitErr == nil {
+		exitErr = fmt.Errorf("no source delivered all %d tracks", len(tracks))
+	}
+	job.update(func(j *Job) {
+		j.Error = fmt.Sprintf("Tried %d sources, none delivered every track", min(len(cands), maxTries))
+	})
 	return nil, sigLines, exitErr, false
+}
+
+// downloadAlbumSource downloads one slsk:// album folder and checks the
+// result against tracks. sldl keeps a partial folder in place
+// (--failed-album-path disable), and when tracks are missing the same source
+// is asked once more: sldl skips the files it already has, so that run only
+// fetches the ones that failed (usually a dropped transfer). A folder still
+// incomplete after that loses this run's files. stall drops a source that
+// keeps everything queued (see killIfStalled); pass it only when another
+// source is left to try.
+func downloadAlbumSource(job *Job, src, bitrate string, tracks []ExpectedTrack, stall bool, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error) {
+	var start time.Time
+	user := strings.TrimPrefix(src, "slsk://")
+	user = user[:max(strings.Index(user, "/"), 0)]
+	for attempt := 1; attempt <= 2; attempt++ {
+		args := buildSldlArgs(username, password, outDir, src, bitrate, true, "--no-progress", "--failed-album-path", "disable")
+		stop := func() {}
+		if stall {
+			stop = killIfStalled(job)
+		}
+		sig, st, err := runSldlAndStream(onLine, onStart, args, outDir)
+		stop()
+		sigLines, exitErr = append(sigLines, sig...), err
+		if attempt == 1 {
+			start = st
+		}
+		if job.isCancelled() {
+			return nil, sigLines, nil
+		}
+		dirs := findSavedAlbums(outDir, start)
+		if len(dirs) == 0 {
+			return nil, sigLines, exitErr
+		}
+		got := localTrackMatches(dirs[0], tracks)
+		if got == len(tracks) {
+			return dirs, sigLines, nil
+		}
+		if attempt == 1 {
+			job.addLog(fmt.Sprintf("[retry] got %d of %d tracks; asking %s again for the rest", got, len(tracks), user))
+			job.update(func(j *Job) {
+				j.Notes = append(j.Notes, fmt.Sprintf("%s delivered %d of %d tracks, retrying the rest", user, got, len(tracks)))
+			})
+			continue
+		}
+		job.update(func(j *Job) {
+			j.Notes = append(j.Notes, fmt.Sprintf("%s still missing %d of %d tracks, dropped", user, len(tracks)-got, len(tracks)))
+		})
+		for _, d := range dirs {
+			removeNewFiles(d, start, job.addLog)
+		}
+	}
+	return nil, sigLines, exitErr
+}
+
+// localTrackMatches counts the tracks with a file in dir (no length check).
+func localTrackMatches(dir string, tracks []ExpectedTrack) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var r slskResult
+	for _, e := range entries {
+		if !e.IsDir() {
+			r.Files = append(r.Files, struct {
+				Filename string
+				Length   int // seconds
+				Bitrate  int
+				Size     int64
+			}{Filename: e.Name()})
+		}
+	}
+	return countTrackMatches(r, tracks)
+}
+
+// removeNewFiles deletes the files in dir modified since start (this
+// download's), then dir itself if that left it empty, so an album folder that
+// was already in the library keeps its old files.
+func removeNewFiles(dir string, start time.Time, log func(string)) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && !e.IsDir() && info.ModTime().After(start) {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
+	if os.Remove(dir) == nil {
+		log(fmt.Sprintf("[cleanup] removed incomplete %s", dir))
+	} else {
+		log(fmt.Sprintf("[cleanup] removed this download's files from %s", dir))
+	}
 }
 
 // fallbackTrack retries a single song as a name search for req.FallbackQuery,
