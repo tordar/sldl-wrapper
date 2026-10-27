@@ -187,11 +187,55 @@ def _full_copies(results: list, tracks: list[dict]) -> list[dict]:
     ))
     return [{
         "source": _link(r),
-        "user": (r.get("User") or {}).get("Username"),
+        "user": _safe_user((r.get("User") or {}).get("Username")),
         "files": len(_audio_files(r)),
         "bitrate": "lossless" if _min_bitrate(r) is None else _min_bitrate(r),
         "free_slot": bool((r.get("User") or {}).get("HasFreeUploadSlot")),
     } for r in full]
+
+
+# ── untrusted text ───────────────────────────────────────────────────────────
+#
+# Soulseek folder names, file names and user names are written by strangers
+# and would reach the model verbatim, which runs with bypassed permissions.
+# Tool results therefore never contain them raw: copies are handed out as
+# opaque ids (the slsk:// paths stay in this process), user names are cut to
+# a short charset, and job details are rebuilt from wrapper-generated fields.
+
+_copies: dict[str, dict] = {}
+_copy_seq = 0
+
+
+def _safe_user(name) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", name or "")[:30] or "?"
+
+
+def _safe_path(path: str) -> str:
+    return re.sub(r"[^\w .,'()&/-]", "", path or "")[:150]
+
+
+def _register_copies(copies: list[dict], rg_id: str) -> list[dict]:
+    """Hand out ids for copies; each remembers the next three as fallbacks."""
+    global _copy_seq
+    out = []
+    ids = []
+    for c in copies:
+        _copy_seq += 1
+        ids.append(f"copy_{_copy_seq}")
+    for i, (cid, c) in enumerate(zip(ids, copies)):
+        _copies[cid] = {"source": c["source"], "user": c["user"], "release_group_id": rg_id,
+                        "alternatives": [x["source"] for x in copies[i + 1:i + 4]]}
+        out.append({"copy": cid, **{k: v for k, v in c.items() if k != "source"}})
+    return out
+
+
+_PHASES = re.compile(
+    r"^(Logging in to Soulseek|Searching Soulseek|Reading the uploader's folder|"
+    r"Uploader has no free slots, waiting in their queue|Reconnecting to Soulseek|Downloading|"
+    r"Matching against MusicBrainz|Nothing new was downloaded|That source failed, looking for another full copy|"
+    r"That source failed, searching for others|Trying another source|Cancelling|"
+    r"Waiting for \d+ download\(s\) ahead|Cancelled\. Removed \d+ partial file\(s\))$")
+_MB_URL = re.compile(r"^https://musicbrainz\.org/release/[0-9a-f-]{36}$")
 
 
 def _resolve(artist: str, album: str, release_group_id: str | None) -> tuple[str, str, list[dict]]:
@@ -399,7 +443,7 @@ def _start_upgrade(args: dict) -> dict:
         json.dump(plan, f)
     return {"status": "downloading", **{k: plan[k] for k in ("job_id", "rel_dir", "release_group_id", "title",
                                                            "low_bitrate_files")},
-            "source": copies[0]["source"]}
+            "user": copies[0]["user"]}
 
 
 def _find_plan(job_id: str) -> tuple[str, dict]:
@@ -455,7 +499,7 @@ def _finish_upgrade(job_id: str, wait_seconds: int) -> dict:
         return abort(f"Download has {len(new_files)} audio files, the release has {len(plan['tracks'])}.")
     low = [os.path.basename(f) for f, t in zip(new_files, new_tags) if t["bitrate"] is not None and t["bitrate"] < MIN_BITRATE - 5]
     if low:
-        return abort("Download has files under 320 kbps.", low_bitrate=low)
+        return abort(f"Download has {len(low)} file(s) under 320 kbps.")
 
     rel_dir = plan["rel_dir"]
     album_dir = os.path.join(MUSIC_ROOT, rel_dir)
@@ -486,8 +530,9 @@ def _finish_upgrade(job_id: str, wait_seconds: int) -> dict:
             os.rmdir(d)
         except OSError:
             pass
-    return {"status": "done", "album": rel_dir, "files": placed, "source": job.get("source") or job.get("query"),
-            "beets_release": (job.get("tag") or {}).get("url"), **restored}
+    url = (job.get("tag") or {}).get("url") or ""
+    return {"status": "done", "album": rel_dir, "files": placed, "source": _safe_user(job.get("source")),
+            "beets_release": url if _MB_URL.match(url) else None, **restored}
 
 
 # ── tools ────────────────────────────────────────────────────────────────────
@@ -538,8 +583,8 @@ async def list_tools() -> list[types.Tool]:
                     "album": {"type": "string"},
                     "release_group_id": {"type": "string", "description": "MusicBrainz release group id; "
                                          "picked automatically from artist/album when omitted."},
-                    "source": {"type": "string", "description": "A specific slsk:// folder from find_copies "
-                               "to download instead of the best one."},
+                    "copy": {"type": "string", "description": "A copy id from find_copies (e.g. 'copy_3') "
+                             "to download instead of the best one."},
                     "subfolder": {"type": "string", "description": "Folder under the music root to save into. "
                                   "Default: the artist name."},
                 },
@@ -598,8 +643,26 @@ async def list_tools() -> list[types.Tool]:
 
 
 def _job_summary(job: dict, tracks: bool) -> dict:
-    out = {k: job.get(k) for k in ("id", "label", "status", "phase", "source", "saved", "tag", "error",
-                                   "notes", "created", "finished") if job.get(k)}
+    """Job fields safe to show the model (see "untrusted text")."""
+    out = {k: job.get(k) for k in ("id", "status", "created", "finished") if job.get(k)}
+    if job.get("label"):
+        out["label"] = job["label"]  # set by the client from MusicBrainz data
+    phase = job.get("phase") or ""
+    if phase:
+        out["phase"] = phase if _PHASES.match(phase) else "Working"
+    if job.get("source"):
+        out["source"] = _safe_user(job["source"])
+    if job.get("saved"):
+        out["saved"] = _safe_path(job["saved"])
+    if job.get("error"):
+        out["error"] = re.sub(r"[^A-Za-z0-9 .,+()-]", "", job["error"])[:120]
+    if job.get("notes"):
+        out["notes"] = len(job["notes"])
+    tag = job.get("tag") or {}
+    if tag:
+        out["tag"] = {k: tag[k] for k in ("status", "similarity", "changes") if k in tag}
+        if _MB_URL.match(tag.get("url") or ""):
+            out["tag"]["url"] = tag["url"]
     ts = job.get("tracks") or []
     if ts:
         states = {}
@@ -607,7 +670,7 @@ def _job_summary(job: dict, tracks: bool) -> dict:
             states[t.get("state")] = states.get(t.get("state"), 0) + 1
         out["track_states"] = states
         if tracks:
-            out["tracks"] = ts
+            out["tracks"] = [{"n": i + 1, "state": t.get("state")} for i, t in enumerate(ts)]
     return out
 
 
@@ -619,21 +682,25 @@ def _call(name: str, args: dict):
         rg_id, title, tracks = _resolve(args["artist"], args["album"], args.get("release_group_id"))
         copies = _full_copies(_preview(f"{args['artist']} - {title}"), tracks)
         return {"release_group_id": rg_id, "title": title, "tracks": len(tracks),
-                "complete_copies": len(copies), "copies": copies[: args.get("limit", 5)]}
+                "complete_copies": len(copies),
+                "copies": _register_copies(copies[: max(args.get("limit", 5), 4)], rg_id)[: args.get("limit", 5)]}
 
     if name == "download_album":
         artist = args["artist"]
         rg_id, title, tracks = _resolve(artist, args["album"], args.get("release_group_id"))
         query = f"{artist} - {title}"
-        alternatives = []
-        source = args.get("source")
-        if not source:
+        if args.get("copy"):
+            picked = _copies.get(args["copy"])
+            if not picked:
+                return {"error": f"Unknown copy {args['copy']}; ids only live for this session. "
+                                 "Run find_copies again."}
+        else:
             copies = _full_copies(_preview(query), tracks)
             if not copies:
                 return {"error": f"No complete {MIN_BITRATE} kbps copy of {query} on Soulseek right now. "
                                  "Try again later or pick one with find_copies."}
-            source = copies[0]["source"]
-            alternatives = [c["source"] for c in copies[1:4]]
+            picked = _copies[_register_copies(copies[:4], rg_id)[0]["copy"]]
+        source, alternatives = picked["source"], picked["alternatives"]
         body = {
             "query": source,
             "album": True,
@@ -645,8 +712,8 @@ def _call(name: str, args: dict):
             "expect": len(tracks),
         }
         job = _post("/download", body)
-        return {"job_id": job["id"], "release_group_id": rg_id, "title": title, "source": source,
-                "alternatives": alternatives}
+        return {"job_id": job["id"], "release_group_id": rg_id, "title": title, "user": picked["user"],
+                "fallbacks": len(alternatives)}
 
     if name == "job_status":
         data = _get("/jobs")
