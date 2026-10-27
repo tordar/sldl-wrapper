@@ -9,6 +9,9 @@ import:
   incremental: no
   log: /data/beets-import.log
   quiet_fallback: skip
+  # A re-download (better bitrate, more tracks) is the same album as one
+  # beets imported before; -q would otherwise skip it untagged.
+  duplicate_action: keep
 
 match:
   # Distances, lower = closer. 0.04 is the beets default; anything looser

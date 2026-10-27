@@ -152,8 +152,6 @@ button.search-btn:hover { background: var(--a2); }
 .header-right { display: flex; align-items: center; gap: 0.5rem; }
 .dl-toggle { display: inline-flex; align-items: center; gap: 0.4rem; }
 .dl-toggle.has-active { border-color: var(--a); color: var(--a2); }
-.dl-toggle.pulse { animation: dl-pulse 0.9s ease-out 2; }
-@keyframes dl-pulse { 0% { box-shadow: 0 0 0 0 var(--a); } 100% { box-shadow: 0 0 0 10px transparent; } }
 .dl-count {
   min-width: 1.1rem; padding: 0 0.3rem;
   border-radius: 999px;
@@ -1179,14 +1177,19 @@ function renderModalResults(results, area, isAlbum, artist, query, tracks = [], 
     (complete(b) - complete(a)) || byMatch(a, b) || ((resultMinBitrate(b) || 0) - (resultMinBitrate(a) || 0)));
 
   // Full copies at 320k+, best first. autoDownload takes the first; the rest
-  // go along so the server can try them when that source fails.
-  const full = tracks.length ? good.filter(r => matches.get(r) === tracks.length) : [];
+  // go along so the server can try them when that source fails. A folder
+  // with far more songs than the release (a 12-song album holding a single's
+  // one title) is not a copy of it. Keep in sync with maxCopyFiles in main.go.
+  const maxCopyFiles = n => 2 * n + 2;
+  const full = tracks.length
+    ? good.filter(r => matches.get(r) === tracks.length && resultAudioFiles(r).length <= maxCopyFiles(tracks.length))
+    : [];
   if (!label && currentItem) label = `${currentItem.artist} – ${currentItem.label}`;
   const pick = result => {
     const link = resultLink(result);
     const alternatives = full.filter(r => r !== result).slice(0, 3).map(resultLink);
     closeModal();
-    download(link, isAlbum, artist, !minOK(result), label, query, tracks, alternatives);
+    download(link, isAlbum, artist, !minOK(result), label, query, tracks, alternatives, matches.get(result));
   };
   if (auto && isAlbum && full.length) {
     pick(full[0]);
@@ -1320,25 +1323,19 @@ let lastJobs  = [];
 
 // fallbackQuery and tracks let the server look for another source when the
 // picked one fails; for an album it only takes one with every track at 320k+.
-// Starting a download doesn't open the panel (on a phone it covers the
-// results); the downloads button pulses and its count goes up instead.
-async function download(query, album, subfolder, lowBitrate = false, label = '', fallbackQuery = '', tracks = [], alternatives = []) {
+async function download(query, album, subfolder, lowBitrate = false, label = '', fallbackQuery = '', tracks = [], alternatives = [], expect = 0) {
+  toggleDownloads(true);
   try {
     const r = await fetch('/download', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        query, album, subfolder, lowBitrate, label, fallbackQuery, alternatives,
+        query, album, subfolder, lowBitrate, label, fallbackQuery, alternatives, expect,
         tracks: tracks.map(t => ({ title: t.title, length: t.length || 0 })),
       }),
     });
     if (!r.ok) throw new Error(await r.text());
-    const btn = document.getElementById('dl-toggle');
-    btn.classList.remove('pulse');
-    void btn.offsetWidth; // restart the animation
-    btn.classList.add('pulse');
   } catch (e) {
-    toggleDownloads(true);
     alertInPanel(`Could not start download: ${e.message}`);
   }
   refreshJobs();

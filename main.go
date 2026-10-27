@@ -344,10 +344,17 @@ func countTrackMatches(r slskResult, tracks []ExpectedTrack) int {
 	return matched
 }
 
+// maxCopyFiles is the most audio files a folder may hold and still count as a
+// copy of a release with n tracks: room for a deluxe edition's bonus tracks,
+// but a 12-song album holding a single's one title is not that single. Keep
+// in sync with maxCopyFiles in static/index.html.
+func maxCopyFiles(n int) int { return 2*n + 2 }
+
 // fallbackCandidates returns slsk:// URLs of the results that hold every
-// track of the tracklist with no audio file below the bitrate floor (unknown
-// bitrate passes, as in sldl), skipping skipUser. Lossy (320k) before
-// lossless, then free upload slots, fewest extra files, upload speed.
+// track of the tracklist, and at most maxCopyFiles audio files, with no audio
+// file below the bitrate floor (unknown bitrate passes, as in sldl), skipping
+// skipUser. Lossy (320k) before lossless, then free upload slots, fewest
+// extra files, upload speed.
 func fallbackCandidates(results []slskResult, tracks []ExpectedTrack, skipUser string) []string {
 	floor, _ := strconv.Atoi(minBitrate)
 	type cand struct {
@@ -362,6 +369,9 @@ func fallbackCandidates(results []slskResult, tracks []ExpectedTrack, skipUser s
 			continue
 		}
 		keys, _, bitrates := r.audioFiles()
+		if len(keys) > maxCopyFiles(len(tracks)) {
+			continue
+		}
 		lowRate := false
 		for _, b := range bitrates {
 			if b > 0 && b < floor {
@@ -727,16 +737,74 @@ func runPromoStrip(emit emitFunc, dir string) {
 	cmd.Wait()
 }
 
+// staleTagStripScript removes the MusicBrainz IDs and edition details
+// (media, label, junk years like 0001) an uploader's files often carry from a
+// release that has since been merged or that isn't the one being matched.
+// beets counts every mismatch against a candidate, so with them a perfect
+// tracklist match can score 0.10-0.23 and be skipped under strong_rec_thresh.
+const staleTagStripScript = `
+import sys, glob, os
+import mutagen
+from mutagen.id3 import ID3
+d = sys.argv[1]
+ID3_DROP = {'TMED', 'TXXX:MEDIA', 'TPUB', 'TXXX:LABEL', 'TXXX:RELEASECOUNTRY', 'TXXX:BARCODE', 'TXXX:CATALOGNUMBER'}
+VORBIS_DROP = {'media', 'label', 'organization', 'releasecountry', 'barcode', 'catalognumber'}
+count = 0
+for f in glob.glob(os.path.join(glob.escape(d), '**', '*'), recursive=True):
+    ext = os.path.splitext(f)[1].lower()
+    try:
+        if ext == '.mp3':
+            audio = tags = ID3(f)
+            drop = [k for k in tags.keys() if k.startswith('UFID') or k.startswith('TXXX:MusicBrainz') or k in ID3_DROP
+                    or (k == 'TDRC' and str(tags[k])[:4] < '1900')]
+        elif ext in ('.flac', '.ogg', '.opus'):
+            audio = mutagen.File(f)
+            tags = audio.tags
+            drop = [k for k in set(tags.keys()) if k.lower().startswith('musicbrainz_') or k.lower() in VORBIS_DROP
+                    or (k.lower() == 'date' and tags[k][0][:4] < '1900')]
+        else:
+            continue
+        for k in drop:
+            del tags[k]
+        if drop:
+            audio.save()
+            count += 1
+    except Exception as e:
+        print('Error ' + f + ': ' + str(e))
+print('Removed stale MusicBrainz/edition tags from ' + str(count) + ' file(s)')
+`
+
+// beetsRetryLine is emitted before the second beets run; Job.beetsLine resets
+// the tag outcome on it.
+const beetsRetryLine = "Skipped; retrying without the files' own MusicBrainz and edition tags..."
+
 func runBeets(emit emitFunc, dir string) {
 	emit("[beets] Auto-tagging with beets...")
+	if !beetsImport(emit, dir) {
+		return
+	}
+	emit("[beets] %s", beetsRetryLine)
+	out, err := exec.Command("python3", "-c", staleTagStripScript, dir).CombinedOutput()
+	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		emit("[beets] %s", l)
+	}
+	if err != nil {
+		emit("[beets] finished with warning: tag cleanup failed: %v", err)
+		return
+	}
+	beetsImport(emit, dir)
+}
 
+// beetsImport runs one quiet beets import of dir and reports whether beets
+// skipped it.
+func beetsImport(emit emitFunc, dir string) (skipped bool) {
 	// -q: never prompt; apply confident MusicBrainz matches, otherwise fall
 	// back to import.quiet_fallback. (-A would be --noautotag.)
 	cmd := exec.Command("beet", "--config=/etc/beets/config.yaml", "import", "-q", dir)
 	pr, pw, err := os.Pipe()
 	if err != nil {
 		emit("[beets] Could not start beets: %v", err)
-		return
+		return false
 	}
 	cmd.Stdout = pw
 	cmd.Stderr = pw
@@ -744,19 +812,24 @@ func runBeets(emit emitFunc, dir string) {
 		pw.Close()
 		pr.Close()
 		emit("[beets] Could not start beets: %v", err)
-		return
+		return false
 	}
 	pw.Close()
 
 	scanner := bufio.NewScanner(pr)
 	for scanner.Scan() {
-		emit("[beets] %s", scanner.Text())
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "Skipping." {
+			skipped = true
+		}
+		emit("[beets] %s", line)
 	}
 	if err := cmd.Wait(); err != nil {
 		emit("[beets] finished with warning: %v", err)
 	} else {
 		emit("[beets] tagging complete")
 	}
+	return skipped
 }
 
 func handleRetag(w http.ResponseWriter, r *http.Request) {
@@ -797,6 +870,9 @@ type DownloadRequest struct {
 	// best first. The album fallback tries them before searching again: a
 	// repeat of the same search minutes later gets far fewer responses.
 	Alternatives []string `json:"alternatives"`
+	// Expect is how many of Tracks the picked folder holds. Below len(Tracks)
+	// the user knowingly picked an incomplete copy, so that many is enough.
+	Expect int `json:"expect"`
 }
 
 type ExpectedTrack struct {
@@ -921,7 +997,37 @@ func searchSlskdOrAlbum(ctx context.Context, query string, progress func(int), n
 		note("Nobody answered; Soulseek may block this artist's name. Retrying with the album title only…")
 	}
 	log.Printf("search %q: no answers, retrying as %q", query, album)
-	return searchSlskd(ctx, album, progress)
+	if results, err = searchSlskd(ctx, album, progress); err != nil {
+		return results, err
+	}
+	// The title alone also finds other artists' folders that happen to hold a
+	// song of that name ("Moon River" on a Takeshi Terauchi album), so keep
+	// only results with the artist somewhere in their file paths.
+	artist, _, _ := strings.Cut(query, " - ")
+	kept := withArtistInPath(results, artist)
+	if note != nil && len(kept) < len(results) {
+		note(fmt.Sprintf("Dropped %d result(s) without %q in their folder or file names", len(results)-len(kept), artist))
+	}
+	return kept, nil
+}
+
+// withArtistInPath returns the results where some file path contains artist,
+// compared by normTitle so punctuation and case don't matter.
+func withArtistInPath(results []slskResult, artist string) []slskResult {
+	want := normTitle(artist)
+	if want == "" {
+		return results
+	}
+	var kept []slskResult
+	for _, r := range results {
+		for _, f := range r.Files {
+			if strings.Contains(normTitle(f.Filename), want) {
+				kept = append(kept, r)
+				break
+			}
+		}
+	}
+	return kept
 }
 
 // previewSlskd is /preview through slskd: same SSE events as the sldl path,
@@ -1052,7 +1158,11 @@ func runDownload(job *Job, req DownloadRequest, username, password, outDir strin
 	var exitErr error
 	if req.Album && len(req.Tracks) > 0 && strings.HasPrefix(req.Query, "slsk://") {
 		startTime = time.Now()
-		saved, sigLines, exitErr = downloadAlbumSource(job, req.Query, bitrate, req.Tracks, len(req.Alternatives) > 0, username, password, outDir, onLine, onStart)
+		need := len(req.Tracks)
+		if req.Expect > 0 && req.Expect < need {
+			need = req.Expect
+		}
+		saved, sigLines, exitErr = downloadAlbumSource(job, req.Query, bitrate, req.Tracks, need, len(req.Alternatives) > 0, username, password, outDir, onLine, onStart)
 	} else {
 		args := buildSldlArgs(username, password, outDir, req.Query, bitrate, req.Album, "--no-progress")
 		sigLines, startTime, exitErr = runSldlAndStream(onLine, onStart, args, outDir)
@@ -1438,7 +1548,7 @@ func tryFallbackCandidates(job *Job, cands []string, tracks []ExpectedTrack, use
 		})
 		job.addLog(fmt.Sprintf("[fallback] trying %s", cand))
 		start := time.Now()
-		saved, sig, err := downloadAlbumSource(job, cand, minBitrate, tracks, i < min(len(cands), maxTries)-1, username, password, outDir, onLine, onStart)
+		saved, sig, err := downloadAlbumSource(job, cand, minBitrate, tracks, len(tracks), i < min(len(cands), maxTries)-1, username, password, outDir, onLine, onStart)
 		if job.isCancelled() {
 			return nil, nil, nil, true
 		}
@@ -1459,14 +1569,14 @@ func tryFallbackCandidates(job *Job, cands []string, tracks []ExpectedTrack, use
 }
 
 // downloadAlbumSource downloads one slsk:// album folder and checks the
-// result against tracks. sldl keeps a partial folder in place
+// result against tracks, of which it needs need. sldl keeps a partial folder in place
 // (--failed-album-path disable), and when tracks are missing the same source
 // is asked once more: sldl skips the files it already has, so that run only
 // fetches the ones that failed (usually a dropped transfer). A folder still
 // incomplete after that loses this run's files. stall drops a source that
 // keeps everything queued (see killIfStalled); pass it only when another
 // source is left to try.
-func downloadAlbumSource(job *Job, src, bitrate string, tracks []ExpectedTrack, stall bool, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error) {
+func downloadAlbumSource(job *Job, src, bitrate string, tracks []ExpectedTrack, need int, stall bool, username, password, outDir string, onLine func(string), onStart func(*os.Process)) (saved, sigLines []string, exitErr error) {
 	var start time.Time
 	user := strings.TrimPrefix(src, "slsk://")
 	user = user[:max(strings.Index(user, "/"), 0)]
@@ -1490,7 +1600,7 @@ func downloadAlbumSource(job *Job, src, bitrate string, tracks []ExpectedTrack, 
 			return nil, sigLines, exitErr
 		}
 		got := localTrackMatches(dirs[0], tracks)
-		if got == len(tracks) {
+		if got >= need {
 			return dirs, sigLines, nil
 		}
 		if attempt == 1 {
@@ -1866,6 +1976,8 @@ func (j *Job) beetsLine(raw string) {
 			return
 		}
 		switch {
+		case trimmed == beetsRetryLine:
+			j.Tag, j.beetsExpect = &JobTag{}, ""
 		case trimmed == "Tagging:", trimmed == "To:":
 			j.beetsExpect = "release"
 		case trimmed == "Correcting tags from:":
